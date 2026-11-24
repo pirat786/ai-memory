@@ -28,6 +28,7 @@ pub fn install_global_rules() -> std::io::Result<Vec<PathBuf>> {
         home.join(".claude").join("CLAUDE.md"),
         home.join(".gemini").join("antigravity").join("AGENTS.md"),
         home.join(".gemini").join("GEMINI.md"),
+        home.join(".codex").join("AGENTS.md"),
     ];
 
     let mut updated = Vec::new();

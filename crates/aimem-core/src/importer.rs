@@ -19,11 +19,80 @@ pub fn import_all(db: &Database, projects_root: Option<&Path>) -> Result<ImportR
     let mut report = ImportReport::default();
     let mut touched_projects = std::collections::HashSet::new();
 
-    // 1. Import ~/.claude/CLAUDE.md -> global
+    // 1. Global rule/memory files across Claude, Antigravity/Gemini, Codex, Cursor
     let home = home_dir();
-    let global_claude = home.join(".claude").join("CLAUDE.md");
-    if global_claude.is_file() {
-        import_markdown_file(db, &global_claude, "global", "Global Preferences", None, "claude", "pref", &mut report, &mut touched_projects)?;
+    for (path, agent) in [
+        (home.join(".claude").join("CLAUDE.md"), "claude"),
+        (home.join(".gemini").join("GEMINI.md"), "antigravity"),
+        (home.join(".gemini").join("antigravity").join("AGENTS.md"), "antigravity"),
+        (home.join(".codex").join("AGENTS.md"), "codex"),
+    ] {
+        if path.is_file() {
+            import_markdown_file(db, &path, "global", "Global Preferences", None, agent, "pref", &mut report, &mut touched_projects)?;
+        }
+    }
+
+    let codex_mem = home.join(".codex").join("memories");
+    if codex_mem.is_dir() {
+        if let Ok(files) = std::fs::read_dir(&codex_mem) {
+            for f in files.flatten() {
+                let p = f.path();
+                if p.extension().and_then(|e| e.to_str()) == Some("md") {
+                    import_markdown_file(db, &p, "global", "Global Preferences", None, "codex", "note", &mut report, &mut touched_projects)?;
+                }
+            }
+        }
+    }
+
+    let cursor_rules = home.join(".cursor").join("rules");
+    if cursor_rules.is_dir() {
+        if let Ok(files) = std::fs::read_dir(&cursor_rules) {
+            for f in files.flatten() {
+                let p = f.path();
+                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if ext == "md" || ext == "mdc" {
+                    import_markdown_file(db, &p, "global", "Global Preferences", None, "cursor", "pref", &mut report, &mut touched_projects)?;
+                }
+            }
+        }
+    }
+
+    // Antigravity knowledge & brain walkthroughs
+    let agy_knowledge = home.join(".gemini").join("antigravity").join("knowledge");
+    if agy_knowledge.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&agy_knowledge) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_file() && p.extension().and_then(|x| x.to_str()) == Some("md") {
+                    import_markdown_file(db, &p, "global", "Global Preferences", None, "antigravity", "note", &mut report, &mut touched_projects)?;
+                } else if p.is_dir() {
+                    if let Ok(sub) = std::fs::read_dir(&p) {
+                        for sf in sub.flatten() {
+                            let sp = sf.path();
+                            if sp.is_file() && sp.extension().and_then(|x| x.to_str()) == Some("md") {
+                                import_markdown_file(db, &sp, "global", "Global Preferences", None, "antigravity", "note", &mut report, &mut touched_projects)?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let agy_brain = home.join(".gemini").join("antigravity").join("brain");
+    if agy_brain.is_dir() {
+        if let Ok(convs) = std::fs::read_dir(&agy_brain) {
+            for c in convs.flatten() {
+                let cdir = c.path();
+                if !cdir.is_dir() {
+                    continue;
+                }
+                let wt = cdir.join("walkthrough.md");
+                if wt.is_file() {
+                    import_markdown_file(db, &wt, "global", "Global Preferences", None, "antigravity", "note", &mut report, &mut touched_projects)?;
+                }
+            }
+        }
     }
 
     // 2. Import ~/.claude/projects/<encoded-path>/memory/*.md
@@ -87,7 +156,9 @@ pub fn import_all(db: &Database, projects_root: Option<&Path>) -> Result<ImportR
                         ("CLAUDE.md", "claude"),
                         ("AGENTS.md", "antigravity"),
                         ("GEMINI.md", "antigravity"),
+                        ("MEMORY.md", "claude"),
                         (".cursorrules", "cursor"),
+                        (".github/copilot-instructions.md", "copilot"),
                     ] {
                         let candidate = pdir.join(fname);
                         if candidate.is_file() {
@@ -102,6 +173,28 @@ pub fn import_all(db: &Database, projects_root: Option<&Path>) -> Result<ImportR
                                 &mut report,
                                 &mut touched_projects,
                             )?;
+                        }
+                    }
+                    let cursor_dir = pdir.join(".cursor").join("rules");
+                    if cursor_dir.is_dir() {
+                        if let Ok(cfiles) = std::fs::read_dir(&cursor_dir) {
+                            for cf in cfiles.flatten() {
+                                let cp = cf.path();
+                                let ext = cp.extension().and_then(|e| e.to_str()).unwrap_or("");
+                                if ext == "md" || ext == "mdc" {
+                                    import_markdown_file(
+                                        db,
+                                        &cp,
+                                        &detected.id,
+                                        &detected.name,
+                                        detected.git_remote.as_deref(),
+                                        "cursor",
+                                        "arch",
+                                        &mut report,
+                                        &mut touched_projects,
+                                    )?;
+                                }
+                            }
                         }
                     }
                 }
