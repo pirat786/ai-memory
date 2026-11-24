@@ -283,13 +283,13 @@
   <aside>
     <div class="brand">
       <h1>ai-memory</h1>
-      <span>No MCP</span>
+      <button id="langBtn" style="padding:2px 8px;font-size:11px;" onclick="toggleLang()">EN</button>
     </div>
     <div class="project-list" id="projectList"></div>
     <div class="sidebar-footer">
       <div class="status-line">
         <span class="dot ok"></span>
-        <span>Агенты и PATH настроены</span>
+        <span id="agentsReadyText">Агенты и PATH настроены</span>
       </div>
       <div class="status-line">
         <span class="dot" id="syncDot"></span>
@@ -297,7 +297,7 @@
       </div>
       <button id="googleActionBtn" class="primary" onclick="handleGoogleAction()">Подключить Google</button>
       <div style="display:flex;gap:6px;">
-        <button style="flex:1;" onclick="openSettings()">Настройки</button>
+        <button id="settingsBtn" style="flex:1;" onclick="openSettings()">Настройки</button>
         <button id="googleLogoutBtn" class="danger" style="display:none;" onclick="disconnectGoogle()">Выйти из Google</button>
       </div>
     </div>
@@ -308,9 +308,9 @@
       <div class="search-box">
         <input id="searchInput" type="search" placeholder="Поиск по памяти (FTS5)..." oninput="debouncedLoadMemories()" />
       </div>
-      <button onclick="importMemories()">Импорт памяти</button>
+      <button id="importBtn" onclick="importMemories()">Импорт памяти</button>
       <button id="updateBtn" class="primary" style="display:none;" onclick="installUpdate()">Обновить</button>
-      <button class="primary" onclick="document.getElementById('newContent').focus()">+ Новая запись</button>
+      <button id="newBtn" class="primary" onclick="document.getElementById('newContent').focus()">+ Новая запись</button>
     </header>
 
     <div class="content">
@@ -331,7 +331,7 @@
             <option value="claude">claude</option>
             <option value="cursor">cursor</option>
           </select>
-          <button class="primary" onclick="addMemory()">Сохранить</button>
+          <button id="saveMemBtn" class="primary" onclick="addMemory()">Сохранить</button>
         </div>
       </div>
 
@@ -341,20 +341,20 @@
 
   <div class="modal-backdrop" id="settingsModal">
     <div class="modal">
-      <h2>Настройки устройства</h2>
+      <h2 id="settingsTitle">Настройки устройства</h2>
       <div class="field">
-        <label>Имя этого ПК</label>
+        <label id="cfgDeviceLabel">Имя этого ПК</label>
         <input id="cfgDevice" placeholder="DESKTOP-WORK" />
       </div>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;margin-top:4px;">
         <input id="cfgAutostart" type="checkbox" style="width:auto;" />
-        Запускать вместе с Windows
+        <span id="cfgAutostartLabel">Запускать вместе с Windows</span>
       </label>
       <div class="composer-row" style="justify-content:space-between;margin-top:6px;">
-        <button onclick="authGoogle()">Переподключить Google</button>
+        <button id="reauthBtn" onclick="authGoogle()">Переподключить Google</button>
         <div style="display:flex;gap:8px;">
-          <button onclick="closeSettings()">Закрыть</button>
-          <button class="primary" onclick="saveSettings()">Сохранить</button>
+          <button id="closeModalBtn" onclick="closeSettings()">Закрыть</button>
+          <button id="saveCfgBtn" class="primary" onclick="saveSettings()">Сохранить</button>
         </div>
       </div>
     </div>
@@ -367,6 +367,133 @@
     const { listen } = window.__TAURI__.event;
     let currentProjectId = 'all';
     let searchTimer = null;
+    let lang = localStorage.getItem('aimem_lang') || 'ru';
+
+    const I18N = {
+      ru: {
+        langBtn: 'EN',
+        agentsReady: 'Агенты и PATH настроены',
+        googleConnected: 'Google Drive подключён',
+        googleDisconnected: 'Google Drive: не подключён',
+        syncPrefix: 'Синк: ',
+        syncNow: 'Синхронизировать',
+        connectGoogle: 'Подключить Google',
+        settings: 'Настройки',
+        signOut: 'Выйти из Google',
+        searchPh: 'Поиск по памяти (FTS5)...',
+        importBtn: 'Импорт памяти',
+        newBtn: '+ Новая запись',
+        contentPh: 'Записать решение, архитектуру, баг или правило...',
+        tagsPh: 'теги через запятую (rust, auth)',
+        save: 'Сохранить',
+        allProjects: 'Все проекты',
+        allProjectsSub: 'общий поток памяти',
+        noMemories: 'Записей пока нет.',
+        delete: 'Удалить',
+        settingsTitle: 'Настройки устройства',
+        pcName: 'Имя этого ПК',
+        autostart: 'Запускать вместе с Windows',
+        reauth: 'Переподключить Google',
+        close: 'Закрыть',
+        enterText: 'Введите текст записи',
+        saved: 'Сохранено',
+        deleted: 'Удалено',
+        settingsSaved: 'Настройки сохранены',
+        signedOut: 'Вышли из аккаунта Google',
+        syncing: 'Синхронизация...',
+        waitingBrowser: 'Ждём вход в браузере...',
+        googleOk: 'Google Drive подключён!',
+        updateTo: 'Обновить до v',
+        updating: 'Обновление...',
+        updateErr: 'Ошибка обновления: ',
+        kinds: [
+          ['decision', 'decision — решение'],
+          ['arch', 'arch — архитектура'],
+          ['bug', 'bug — грабли / фикс'],
+          ['pref', 'pref — предпочтение'],
+          ['note', 'note — заметка'],
+        ],
+      },
+      en: {
+        langBtn: 'RU',
+        agentsReady: 'Agents & PATH ready',
+        googleConnected: 'Google Drive connected',
+        googleDisconnected: 'Google Drive: not connected',
+        syncPrefix: 'Synced: ',
+        syncNow: 'Sync now',
+        connectGoogle: 'Connect Google',
+        settings: 'Settings',
+        signOut: 'Sign out',
+        searchPh: 'Search memory (FTS5)...',
+        importBtn: 'Import memory',
+        newBtn: '+ New memory',
+        contentPh: 'Record a decision, architecture note, bug fix, or rule...',
+        tagsPh: 'comma-separated tags (rust, auth)',
+        save: 'Save',
+        allProjects: 'All projects',
+        allProjectsSub: 'shared memory stream',
+        noMemories: 'No memories yet.',
+        delete: 'Delete',
+        settingsTitle: 'Device Settings',
+        pcName: 'PC Name',
+        autostart: 'Launch on Windows startup',
+        reauth: 'Reconnect Google',
+        close: 'Close',
+        enterText: 'Enter memory text',
+        saved: 'Saved',
+        deleted: 'Deleted',
+        settingsSaved: 'Settings saved',
+        signedOut: 'Signed out of Google',
+        syncing: 'Syncing...',
+        waitingBrowser: 'Waiting for browser login...',
+        googleOk: 'Google Drive connected!',
+        updateTo: 'Update to v',
+        updating: 'Updating...',
+        updateErr: 'Update error: ',
+        kinds: [
+          ['decision', 'decision — choice'],
+          ['arch', 'arch — architecture'],
+          ['bug', 'bug — fix / gotcha'],
+          ['pref', 'pref — preference'],
+          ['note', 'note — note'],
+        ],
+      },
+    };
+
+    function t(key) { return (I18N[lang] || I18N.ru)[key]; }
+
+    function applyTranslations() {
+      document.documentElement.lang = lang;
+      document.getElementById('langBtn').textContent = t('langBtn');
+      document.getElementById('agentsReadyText').textContent = t('agentsReady');
+      document.getElementById('settingsBtn').textContent = t('settings');
+      document.getElementById('googleLogoutBtn').textContent = t('signOut');
+      document.getElementById('searchInput').placeholder = t('searchPh');
+      document.getElementById('importBtn').textContent = t('importBtn');
+      document.getElementById('newBtn').textContent = t('newBtn');
+      document.getElementById('newContent').placeholder = t('contentPh');
+      document.getElementById('newTags').placeholder = t('tagsPh');
+      document.getElementById('saveMemBtn').textContent = t('save');
+      document.getElementById('settingsTitle').textContent = t('settingsTitle');
+      document.getElementById('cfgDeviceLabel').textContent = t('pcName');
+      document.getElementById('cfgAutostartLabel').textContent = t('autostart');
+      document.getElementById('reauthBtn').textContent = t('reauth');
+      document.getElementById('closeModalBtn').textContent = t('close');
+      document.getElementById('saveCfgBtn').textContent = t('save');
+      const kindSel = document.getElementById('newKind');
+      const prevKind = kindSel.value;
+      kindSel.innerHTML = t('kinds').map(([v, lbl]) => `<option value="${v}">${lbl}</option>`).join('');
+      kindSel.value = prevKind || 'decision';
+    }
+
+    async function toggleLang() {
+      lang = lang === 'ru' ? 'en' : 'ru';
+      localStorage.setItem('aimem_lang', lang);
+      applyTranslations();
+      await loadStatus();
+      await loadProjects();
+      await loadMemories();
+    }
 
     function toast(msg) {
       const el = document.getElementById('toast');
@@ -387,15 +514,15 @@
       if (isGoogleConnected) {
         dot.classList.add('ok');
         txt.textContent = st.last_sync_at
-          ? `Синк: ${new Date(st.last_sync_at).toLocaleString()}`
-          : 'Google Drive подключён';
-        btn.textContent = 'Синхронизировать';
+          ? t('syncPrefix') + new Date(st.last_sync_at).toLocaleString()
+          : t('googleConnected');
+        btn.textContent = t('syncNow');
         btn.classList.remove('primary');
         logoutBtn.style.display = 'inline-flex';
       } else {
         dot.classList.remove('ok');
-        txt.textContent = 'Google Drive: не подключён';
-        btn.textContent = 'Подключить Google';
+        txt.textContent = t('googleDisconnected');
+        btn.textContent = t('connectGoogle');
         btn.classList.add('primary');
         logoutBtn.style.display = 'none';
       }
@@ -417,7 +544,7 @@
 
       const allEl = document.createElement('div');
       allEl.className = 'project-item' + (currentProjectId === 'all' ? ' active' : '');
-      allEl.innerHTML = `<div><div class="project-name">Все проекты</div><div class="project-sub">общий поток памяти</div></div>`;
+      allEl.innerHTML = `<div><div class="project-name">${escapeHtml(t('allProjects'))}</div><div class="project-sub">${escapeHtml(t('allProjectsSub'))}</div></div>`;
       allEl.onclick = () => { currentProjectId = 'all'; loadProjects(); loadMemories(); };
       list.appendChild(allEl);
 
@@ -451,7 +578,7 @@
       box.innerHTML = '';
 
       if (!items.length) {
-        box.innerHTML = `<div style="color:var(--muted);font-size:13px;padding:16px;">Записей пока нет.</div>`;
+        box.innerHTML = `<div style="color:var(--muted);font-size:13px;padding:16px;">${escapeHtml(t('noMemories'))}</div>`;
         return;
       }
 
@@ -471,7 +598,7 @@
             </div>
             <div style="display:flex;align-items:center;gap:8px;">
               <span class="memory-time">${new Date(m.updated_at).toLocaleString()}</span>
-              <button class="danger" style="padding:3px 8px;font-size:11px;" onclick="deleteMemory('${m.id}')">Удалить</button>
+              <button class="danger" style="padding:3px 8px;font-size:11px;" onclick="deleteMemory('${m.id}')">${escapeHtml(t('delete'))}</button>
             </div>
           </div>
           <div class="memory-body">${escapeHtml(m.content)}</div>
@@ -598,6 +725,7 @@
     }
 
     (async () => {
+      applyTranslations();
       await loadStatus();
       await loadProjects();
       await loadMemories();
