@@ -18,6 +18,8 @@ pub struct ImportReport {
 pub fn import_all(db: &Database, projects_root: Option<&Path>) -> Result<ImportReport, String> {
     let mut report = ImportReport::default();
     let mut touched_projects = std::collections::HashSet::new();
+    let default_cods = Path::new(r"C:\RABOTA\Cods");
+    let effective_root = projects_root.or_else(|| if default_cods.is_dir() { Some(default_cods) } else { None });
 
     // 1. Global rule/memory files across Claude, Antigravity/Gemini, Codex, Cursor
     let home = home_dir();
@@ -142,8 +144,8 @@ pub fn import_all(db: &Database, projects_root: Option<&Path>) -> Result<ImportR
         }
     }
 
-    // 3. Scan a projects root directory (depth 1) for CLAUDE.md, AGENTS.md, GEMINI.md, .cursorrules
-    if let Some(root) = projects_root {
+    // 3. Scan a projects root directory (depth 1) for CLAUDE.md, AGENTS.md, GEMINI.md, .cursorrules, README.md, docs/ARCHITECTURE.md
+    if let Some(root) = effective_root {
         if root.is_dir() {
             if let Ok(entries) = std::fs::read_dir(root) {
                 for entry in entries.flatten() {
@@ -159,6 +161,8 @@ pub fn import_all(db: &Database, projects_root: Option<&Path>) -> Result<ImportR
                         ("MEMORY.md", "claude"),
                         (".cursorrules", "cursor"),
                         (".github/copilot-instructions.md", "copilot"),
+                        ("docs/ARCHITECTURE.md", "project"),
+                        ("README.md", "project"),
                     ] {
                         let candidate = pdir.join(fname);
                         if candidate.is_file() {
@@ -224,13 +228,63 @@ fn resolve_claude_project_folder(encoded: &str) -> (String, String, Option<Strin
 
 fn decode_windows_claude_path(encoded: &str) -> Option<PathBuf> {
     let bytes = encoded.as_bytes();
-    if bytes.len() >= 4 && bytes[0].is_ascii_alphabetic() && &bytes[1..3] == b"--" {
-        let drive = bytes[0] as char;
-        let rest = &encoded[3..];
-        let joined = format!("{drive}:\\{}", rest.replace('-', "\\"));
-        return Some(PathBuf::from(joined));
+    if bytes.len() < 4 || !bytes[0].is_ascii_alphabetic() || &bytes[1..3] != b"--" {
+        return None;
     }
-    None
+    let drive = bytes[0] as char;
+    let mut cur = PathBuf::from(format!("{drive}:\\"));
+    let mut rest = encoded[3..].to_string();
+
+    while !rest.is_empty() {
+        rest = rest.trim_start_matches('-').to_string();
+        if rest.is_empty() {
+            break;
+        }
+        let mut matched: Option<(PathBuf, usize)> = None;
+        if let Ok(entries) = std::fs::read_dir(&cur) {
+            let mut candidates: Vec<(String, PathBuf)> = entries
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| {
+                    let name = e.file_name().to_str()?.to_string();
+                    Some((name, e.path()))
+                })
+                .collect();
+            candidates.sort_by(|a, b| b.0.chars().count().cmp(&a.0.chars().count()));
+            let rest_norm: String = rest
+                .chars()
+                .map(|c| if c == '_' || c == ' ' { '-' } else { c.to_ascii_lowercase() })
+                .collect();
+
+            for (name, path) in candidates {
+                let name_norm: String = name
+                    .chars()
+                    .map(|c| if c == '_' || c == ' ' { '-' } else { c.to_ascii_lowercase() })
+                    .collect();
+                let char_count = name_norm.chars().count();
+                if rest_norm == name_norm {
+                    matched = Some((path, rest.chars().count()));
+                    break;
+                }
+                if rest_norm.starts_with(&format!("{name_norm}-")) {
+                    matched = Some((path, char_count));
+                    break;
+                }
+            }
+        }
+        if let Some((next_path, consumed_chars)) = matched {
+            cur = next_path;
+            rest = rest.chars().skip(consumed_chars).collect();
+        } else {
+            break;
+        }
+    }
+
+    if cur.as_os_str().len() > 3 && cur.is_dir() {
+        Some(cur)
+    } else {
+        None
+    }
 }
 
 fn import_markdown_file(
