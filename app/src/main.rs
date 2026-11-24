@@ -187,8 +187,14 @@ async fn import_memories(projects_dir: Option<String>) -> Result<ImportReport, S
 }
 
 #[tauri::command]
-fn quit_app(app: tauri::AppHandle) {
-    app.exit(0);
+fn disconnect_google() -> Result<(), String> {
+    let mut cfg = load_config();
+    cfg.google_refresh_token = None;
+    cfg.google_access_token = None;
+    cfg.google_token_expires_at = None;
+    cfg.drive_file_id = None;
+    cfg.last_sync_at = None;
+    save_config(&cfg).map_err(|e| e.to_string())
 }
 
 fn show_main_window(app: &tauri::AppHandle) {
@@ -212,7 +218,7 @@ fn main() {
             sync_now,
             install_rules,
             import_memories,
-            quit_app,
+            disconnect_google,
         ])
         .setup(|app| {
             let open_item = MenuItem::with_id(app, "open", "Открыть AI Memory", true, None::<&str>)?;

@@ -298,7 +298,7 @@
       <button id="googleActionBtn" class="primary" onclick="handleGoogleAction()">Подключить Google</button>
       <div style="display:flex;gap:6px;">
         <button style="flex:1;" onclick="openSettings()">Настройки</button>
-        <button class="danger" onclick="quitApp()">Выход</button>
+        <button id="googleLogoutBtn" class="danger" style="display:none;" onclick="disconnectGoogle()">Выйти из Google</button>
       </div>
     </div>
   </aside>
@@ -378,6 +378,7 @@
       const dot = document.getElementById('syncDot');
       const txt = document.getElementById('syncStatusText');
       const btn = document.getElementById('googleActionBtn');
+      const logoutBtn = document.getElementById('googleLogoutBtn');
       if (isGoogleConnected) {
         dot.classList.add('ok');
         txt.textContent = st.last_sync_at
@@ -385,11 +386,13 @@
           : 'Google Drive подключён';
         btn.textContent = 'Синхронизировать';
         btn.classList.remove('primary');
+        logoutBtn.style.display = 'inline-flex';
       } else {
         dot.classList.remove('ok');
         txt.textContent = 'Google Drive: не подключён';
         btn.textContent = 'Подключить Google';
         btn.classList.add('primary');
+        logoutBtn.style.display = 'none';
       }
       document.getElementById('cfgDevice').value = st.device_name || '';
     }
@@ -529,7 +532,11 @@
 
     function openSettings() { document.getElementById('settingsModal').classList.add('open'); }
     function closeSettings() { document.getElementById('settingsModal').classList.remove('open'); }
-    async function quitApp() { await invoke('quit_app'); }
+    async function disconnectGoogle() {
+      await invoke('disconnect_google');
+      toast('Вышли из аккаунта Google');
+      await loadStatus();
+    }
 
     async function saveSettings() {
       await invoke('save_settings', {
