@@ -69,6 +69,7 @@ pub struct AppConfig {
     pub device_name: Option<String>,
     pub auto_sync: bool,
     pub auto_import_done: bool,
+    pub autostart_configured: bool,
 }
 
 pub fn data_dir() -> PathBuf {

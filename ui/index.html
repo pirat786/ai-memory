@@ -346,6 +346,10 @@
         <label>Имя этого ПК</label>
         <input id="cfgDevice" placeholder="DESKTOP-WORK" />
       </div>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;margin-top:4px;">
+        <input id="cfgAutostart" type="checkbox" style="width:auto;" />
+        Запускать вместе с Windows
+      </label>
       <div class="composer-row" style="justify-content:space-between;margin-top:6px;">
         <button onclick="authGoogle()">Переподключить Google</button>
         <div style="display:flex;gap:8px;">
@@ -531,7 +535,10 @@
       }
     }
 
-    function openSettings() { document.getElementById('settingsModal').classList.add('open'); }
+    async function openSettings() {
+      document.getElementById('cfgAutostart').checked = await invoke('get_autostart');
+      document.getElementById('settingsModal').classList.add('open');
+    }
     function closeSettings() { document.getElementById('settingsModal').classList.remove('open'); }
     async function disconnectGoogle() {
       await invoke('disconnect_google');
@@ -544,6 +551,9 @@
         deviceName: document.getElementById('cfgDevice').value,
         googleClientId: null,
         googleClientSecret: null,
+      });
+      await invoke('set_autostart', {
+        enabled: document.getElementById('cfgAutostart').checked,
       });
       toast('Настройки сохранены');
       closeSettings();

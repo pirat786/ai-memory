@@ -198,6 +198,40 @@ fn disconnect_google() -> Result<(), String> {
 }
 
 #[tauri::command]
+fn get_autostart(app: tauri::AppHandle) -> bool {
+    #[cfg(windows)]
+    {
+        use tauri_plugin_autostart::ManagerExt;
+        return app.autolaunch().is_enabled().unwrap_or(false);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = app;
+        false
+    }
+}
+
+#[tauri::command]
+fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        use tauri_plugin_autostart::ManagerExt;
+        let mgr = app.autolaunch();
+        if enabled {
+            mgr.enable().map_err(|e| e.to_string())?;
+        } else {
+            mgr.disable().map_err(|e| e.to_string())?;
+        }
+        return Ok(mgr.is_enabled().unwrap_or(enabled));
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (app, enabled);
+        Ok(false)
+    }
+}
+
+#[tauri::command]
 async fn install_update(app: tauri::AppHandle) -> Result<bool, String> {
     #[cfg(windows)]
     {
@@ -226,7 +260,12 @@ fn main() {
     let mut builder = tauri::Builder::default();
     #[cfg(windows)]
     {
-        builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+        builder = builder
+            .plugin(tauri_plugin_updater::Builder::new().build())
+            .plugin(tauri_plugin_autostart::init(
+                tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+                None,
+            ));
     }
     builder
         .invoke_handler(tauri::generate_handler![
@@ -242,6 +281,8 @@ fn main() {
             import_memories,
             disconnect_google,
             install_update,
+            get_autostart,
+            set_autostart,
         ])
         .setup(|app| {
             let open_item = MenuItem::with_id(app, "open", "Открыть AI Memory", true, None::<&str>)?;
@@ -291,6 +332,13 @@ fn main() {
                 let _ = install_global_rules();
 
                 let mut cfg = load_config();
+                #[cfg(windows)]
+                if !cfg.autostart_configured {
+                    use tauri_plugin_autostart::ManagerExt;
+                    let _ = handle.autolaunch().enable();
+                    cfg.autostart_configured = true;
+                    let _ = save_config(&cfg);
+                }
                 if !cfg.auto_import_done {
                     if let Ok(db) = Database::open_default() {
                         let default_dir = std::path::Path::new(r"C:\RABOTA\Cods");
