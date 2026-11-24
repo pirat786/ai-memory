@@ -26,5 +26,13 @@
     "active": true,
     "targets": ["nsis"],
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.ico"]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEFERjFCNkExODNBMDgyMDEKUldRQmdxQ0RvYmJ4cmF0dFVpSXEwNG1KaGJyZ2xtSmcvbEY1c1M5WVpaTzFzUDF6bmVHeVpLWmgK",
+      "endpoints": [
+        "https://github.com/pirat786/ai-memory/releases/latest/download/latest.json"
+      ]
+    }
   }
 }
