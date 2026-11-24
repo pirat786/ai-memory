@@ -197,6 +197,23 @@ fn disconnect_google() -> Result<(), String> {
     save_config(&cfg).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn install_update(app: tauri::AppHandle) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        use tauri_plugin_updater::UpdaterExt;
+        let updater = app.updater().map_err(|e| e.to_string())?;
+        if let Some(update) = updater.check().await.map_err(|e| e.to_string())? {
+            update
+                .download_and_install(|_, _| {}, || {})
+                .await
+                .map_err(|e| e.to_string())?;
+            app.restart();
+        }
+    }
+    Ok(false)
+}
+
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.show();
@@ -206,7 +223,12 @@ fn show_main_window(app: &tauri::AppHandle) {
 }
 
 fn main() {
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default();
+    #[cfg(windows)]
+    {
+        builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    }
+    builder
         .invoke_handler(tauri::generate_handler![
             get_status,
             list_projects,
@@ -219,6 +241,7 @@ fn main() {
             install_rules,
             import_memories,
             disconnect_google,
+            install_update,
         ])
         .setup(|app| {
             let open_item = MenuItem::with_id(app, "open", "Открыть AI Memory", true, None::<&str>)?;
@@ -261,7 +284,7 @@ fn main() {
             }
             let _tray = builder.build(app)?;
 
-            // Auto-configure PATH, agent rules, first-run import, and background sync
+            // Auto-configure PATH, agent rules, first-run import, and background sync + updater
             let handle = app.handle().clone();
             std::thread::spawn(move || {
                 let _ = ensure_aimem_in_path();
@@ -278,6 +301,19 @@ fn main() {
                             let _ = handle.emit("memory-synced", ());
                         }
                     }
+                }
+
+                #[cfg(windows)]
+                {
+                    let upd_handle = handle.clone();
+                    tauri::async_runtime::spawn(async move {
+                        use tauri_plugin_updater::UpdaterExt;
+                        if let Ok(updater) = upd_handle.updater() {
+                            if let Ok(Some(update)) = updater.check().await {
+                                let _ = upd_handle.emit("update-available", update.version.clone());
+                            }
+                        }
+                    });
                 }
 
                 loop {

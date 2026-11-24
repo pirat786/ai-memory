@@ -309,6 +309,7 @@
         <input id="searchInput" type="search" placeholder="Поиск по памяти (FTS5)..." oninput="debouncedLoadMemories()" />
       </div>
       <button onclick="importMemories()">Импорт памяти</button>
+      <button id="updateBtn" class="primary" style="display:none;" onclick="installUpdate()">Обновить</button>
       <button class="primary" onclick="document.getElementById('newContent').focus()">+ Новая запись</button>
     </header>
 
@@ -567,6 +568,19 @@
       }
     }
 
+    async function installUpdate() {
+      const btn = document.getElementById('updateBtn');
+      btn.disabled = true;
+      btn.textContent = 'Обновление...';
+      try {
+        await invoke('install_update');
+      } catch (e) {
+        toast('Ошибка обновления: ' + e);
+        btn.disabled = false;
+        btn.textContent = 'Обновить';
+      }
+    }
+
     function escapeHtml(str) {
       return String(str).replace(/[&<>"']/g, c => ({
         '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
@@ -581,6 +595,11 @@
         await loadStatus();
         await loadProjects();
         await loadMemories();
+      });
+      await listen('update-available', (e) => {
+        const btn = document.getElementById('updateBtn');
+        btn.textContent = 'Обновить до v' + e.payload;
+        btn.style.display = 'inline-flex';
       });
     })();
   </script>

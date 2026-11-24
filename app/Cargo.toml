@@ -17,3 +17,6 @@ aimem-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2", features = ["tray-icon"] }
+
+[target.'cfg(windows)'.dependencies]
+tauri-plugin-updater = "2"
