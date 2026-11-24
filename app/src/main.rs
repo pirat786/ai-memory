@@ -146,16 +146,24 @@ fn save_settings(
 }
 
 #[tauri::command]
-fn auth_google() -> Result<(), String> {
-    let mut cfg = load_config();
-    authenticate_google(&mut cfg).map_err(|e| e.to_string())
+async fn auth_google() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let mut cfg = load_config();
+        authenticate_google(&mut cfg).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn sync_now() -> Result<SyncReport, String> {
-    let mut db = Database::open_default().map_err(|e| e.to_string())?;
-    let mut cfg = load_config();
-    sync_with_drive(&mut db, &mut cfg).map_err(|e| e.to_string())
+async fn sync_now() -> Result<SyncReport, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let mut db = Database::open_default().map_err(|e| e.to_string())?;
+        let mut cfg = load_config();
+        sync_with_drive(&mut db, &mut cfg).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]

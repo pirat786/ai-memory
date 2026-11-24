@@ -114,8 +114,9 @@ pub fn authenticate_google(cfg: &mut AppConfig) -> Result<()> {
     }
 
     let request = server
-        .recv()
-        .map_err(|e| SyncError::OAuth(format!("Callback receive failed: {e}")))?;
+        .recv_timeout(std::time::Duration::from_secs(180))
+        .map_err(|e| SyncError::OAuth(format!("Callback receive failed: {e}")))?
+        .ok_or_else(|| SyncError::OAuth("Authorization timed out (3 minutes)".into()))?;
 
     let req_url = format!("http://127.0.0.1:{port}{}", request.url());
     let parsed = Url::parse(&req_url).map_err(|e| SyncError::OAuth(e.to_string()))?;
@@ -345,8 +346,8 @@ pub fn default_device_name() -> String {
 pub fn open_browser(url: &str) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("cmd")
-            .args(["/c", "start", "", url])
+        std::process::Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", url])
             .spawn()?;
         return Ok(());
     }

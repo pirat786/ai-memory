@@ -291,8 +291,8 @@
         <span class="dot" id="syncDot"></span>
         <span id="syncStatusText">Google Drive: не подключён</span>
       </div>
-      <button onclick="syncNow()">Синхронизировать</button>
-      <button onclick="openSettings()">Настройки Google и агентов</button>
+      <button id="googleActionBtn" class="primary" onclick="handleGoogleAction()">Подключить Google</button>
+      <button onclick="openSettings()">Имя ПК и настройки</button>
     </div>
   </aside>
 
@@ -333,21 +333,13 @@
 
   <div class="modal-backdrop" id="settingsModal">
     <div class="modal">
-      <h2>Настройки Google Drive Sync</h2>
+      <h2>Настройки устройства</h2>
       <div class="field">
         <label>Имя этого ПК</label>
         <input id="cfgDevice" placeholder="DESKTOP-WORK" />
       </div>
-      <div class="field">
-        <label>Google OAuth Client ID (Desktop app)</label>
-        <input id="cfgClientId" placeholder="123456-xxx.apps.googleusercontent.com" />
-      </div>
-      <div class="field">
-        <label>Google OAuth Client Secret (если требуется)</label>
-        <input id="cfgClientSecret" type="password" placeholder="GOCSPX-..." />
-      </div>
       <div class="composer-row" style="justify-content:space-between;margin-top:6px;">
-        <button onclick="authGoogle()">Подключить Google</button>
+        <button onclick="authGoogle()">Переподключить Google</button>
         <div style="display:flex;gap:8px;">
           <button onclick="closeSettings()">Закрыть</button>
           <button class="primary" onclick="saveSettings()">Сохранить</button>
@@ -371,21 +363,36 @@
       setTimeout(() => el.classList.remove('show'), 3200);
     }
 
+    let isGoogleConnected = false;
+
     async function loadStatus() {
       const st = await invoke('get_status');
+      isGoogleConnected = !!st.google_connected;
       const dot = document.getElementById('syncDot');
       const txt = document.getElementById('syncStatusText');
-      if (st.google_connected) {
+      const btn = document.getElementById('googleActionBtn');
+      if (isGoogleConnected) {
         dot.classList.add('ok');
         txt.textContent = st.last_sync_at
           ? `Синк: ${new Date(st.last_sync_at).toLocaleString()}`
           : 'Google Drive подключён';
+        btn.textContent = 'Синхронизировать';
+        btn.classList.remove('primary');
       } else {
         dot.classList.remove('ok');
         txt.textContent = 'Google Drive: не подключён';
+        btn.textContent = 'Подключить Google';
+        btn.classList.add('primary');
       }
       document.getElementById('cfgDevice').value = st.device_name || '';
-      document.getElementById('cfgClientId').value = st.google_client_id || '';
+    }
+
+    async function handleGoogleAction() {
+      if (isGoogleConnected) {
+        await syncNow();
+      } else {
+        await authGoogle();
+      }
     }
 
     async function loadProjects() {
@@ -489,6 +496,10 @@
     }
 
     async function syncNow() {
+      const btn = document.getElementById('googleActionBtn');
+      const prev = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = 'Синхронизация...';
       try {
         const res = await invoke('sync_now');
         toast(`Синхронизировано (+${res.merged.memories_added} / ~${res.merged.memories_updated})`);
@@ -497,6 +508,9 @@
         await loadMemories();
       } catch (e) {
         toast(String(e));
+      } finally {
+        btn.disabled = false;
+        if (btn.textContent === 'Синхронизация...') btn.textContent = prev;
       }
     }
 
@@ -506,8 +520,8 @@
     async function saveSettings() {
       await invoke('save_settings', {
         deviceName: document.getElementById('cfgDevice').value,
-        googleClientId: document.getElementById('cfgClientId').value,
-        googleClientSecret: document.getElementById('cfgClientSecret').value || null,
+        googleClientId: null,
+        googleClientSecret: null,
       });
       toast('Настройки сохранены');
       closeSettings();
@@ -515,13 +529,20 @@
     }
 
     async function authGoogle() {
-      await saveSettings();
+      const btn = document.getElementById('googleActionBtn');
+      btn.disabled = true;
+      btn.textContent = 'Ждём вход в браузере...';
       try {
         await invoke('auth_google');
         toast('Google Drive подключён!');
+        closeSettings();
         await loadStatus();
+        await syncNow();
       } catch (e) {
         toast(String(e));
+        await loadStatus();
+      } finally {
+        btn.disabled = false;
       }
     }
 
