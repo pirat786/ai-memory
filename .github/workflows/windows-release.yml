@@ -44,6 +44,31 @@ jobs:
             echo "Release $tag does not exist yet, will build and publish."
             echo "should_release=true" >> "$GITHUB_OUTPUT"
           fi
+      - name: Verify release keys and configuration
+        if: steps.version.outputs.should_release == 'true'
+        env:
+          TAURI_SIGNING_PUBLIC_KEY: ${{ vars.TAURI_SIGNING_PUBLIC_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          AIMEM_GOOGLE_CLIENT_ID: ${{ vars.AIMEM_GOOGLE_CLIENT_ID }}
+          AIMEM_GOOGLE_CLIENT_SECRET: ${{ secrets.AIMEM_GOOGLE_CLIENT_SECRET }}
+        run: |
+          if [[ -z "${TAURI_SIGNING_PUBLIC_KEY// }" ]]; then
+            echo "Missing TAURI_SIGNING_PUBLIC_KEY repository variable." >&2
+            exit 1
+          fi
+          if [[ -z "${TAURI_SIGNING_PRIVATE_KEY// }" ]]; then
+            echo "Missing TAURI_SIGNING_PRIVATE_KEY repository secret." >&2
+            exit 1
+          fi
+          if [[ -z "${AIMEM_GOOGLE_CLIENT_ID// }" || -z "${AIMEM_GOOGLE_CLIENT_SECRET// }" ]]; then
+            echo "Missing AIMEM_GOOGLE_CLIENT_ID or AIMEM_GOOGLE_CLIENT_SECRET." >&2
+            exit 1
+          fi
+          trimmed_id=$(echo "$AIMEM_GOOGLE_CLIENT_ID" | tr -d '[:space:]')
+          if [[ "$trimmed_id" != *.apps.googleusercontent.com ]]; then
+            echo "AIMEM_GOOGLE_CLIENT_ID must end with .apps.googleusercontent.com." >&2
+            exit 1
+          fi
 
   windows:
     needs: check
