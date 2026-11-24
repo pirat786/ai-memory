@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use aimem_core::db::{data_dir, load_config, save_config, Database, Memory};
+use aimem_core::importer::{import_all, ImportReport};
 use aimem_core::rules::install_global_rules;
 use aimem_core::sync::{
     authenticate_google, default_device_name, resolve_client_creds, sync_with_drive, SyncReport,
@@ -172,6 +173,19 @@ fn install_rules() -> Result<Vec<String>, String> {
     Ok(files.into_iter().map(|p| p.display().to_string()).collect())
 }
 
+#[tauri::command]
+async fn import_memories(projects_dir: Option<String>) -> Result<ImportReport, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = Database::open_default().map_err(|e| e.to_string())?;
+        let p = projects_dir
+            .filter(|s| !s.trim().is_empty())
+            .map(std::path::PathBuf::from);
+        import_all(&db, p.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.show();
@@ -192,6 +206,7 @@ fn main() {
             auth_google,
             sync_now,
             install_rules,
+            import_memories,
         ])
         .setup(|app| {
             let open_item = MenuItem::with_id(app, "open", "Открыть AI Memory", true, None::<&str>)?;

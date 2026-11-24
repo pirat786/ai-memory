@@ -1,4 +1,5 @@
 use aimem_core::db::{data_dir, load_config, save_config, Database};
+use aimem_core::importer::import_all;
 use aimem_core::project::detect_project;
 use aimem_core::rules::{install_global_rules, install_local_rules};
 use aimem_core::sync::{authenticate_google, sync_with_drive};
@@ -70,6 +71,11 @@ enum Commands {
     InstallRules {
         #[arg(long)]
         local: bool,
+    },
+    /// Import existing memories from ~/.claude and project folders
+    Import {
+        #[arg(long)]
+        projects_dir: Option<std::path::PathBuf>,
     },
     /// Show database path and sync status
     Status,
@@ -262,6 +268,17 @@ fn run(cmd: Commands) -> Result<(), String> {
                     println!("  - {}", f.display());
                 }
             }
+        }
+        Commands::Import { projects_dir } => {
+            let db = Database::open_default().map_err(|e| e.to_string())?;
+            let report = import_all(&db, projects_dir.as_deref())?;
+            println!(
+                "Scanned {} files: {} imported, {} duplicates skipped ({} projects).",
+                report.files_scanned,
+                report.memories_imported,
+                report.memories_skipped_duplicate,
+                report.projects_touched
+            );
         }
         Commands::Status => {
             let db = Database::open_default().map_err(|e| e.to_string())?;
