@@ -1,24 +1,24 @@
-# ai-memory (`aimem`)
+# AI Memory (`aimem` + Tauri Desktop)
 
-Единая локальная память для ИИ-агентов (**Antigravity**, **Claude Code**, **Cursor**, **Gemini CLI**) без MCP — с общим хранилищем SQLite + FTS5, встроенным Web UI и синхронизацией между компьютерами через **Google Drive (`drive.appdata`)**.
+Единая локальная память для ИИ-агентов (**Antigravity**, **Claude Code**, **Cursor**, **Gemini CLI**) без MCP — с общим хранилищем SQLite + FTS5, десктопным приложением на **Tauri 2** (окно + трей + автосинк) и синхронизацией между компьютерами через **Google Drive (`drive.appdata`)**.
 
-## Возможности
+## Структура проекта
 
-- **Без MCP:** агенты работают через быстрый CLI (`aimem context`, `aimem add`, `aimem search`).
-- **Умная привязка к проекту:** проект определяется по `git remote origin` (нормализует HTTPS и SSH к единому ID), поэтому `C:\RABOTA\proj` на одном ПК и `D:\Code\proj` на другом делят общую память.
-- **Полнотекстовый поиск (SQLite FTS5):** мгновенный поиск по решениям, архитектуре, багам и правилам.
-- **Встроенный Web UI (`aimem ui`):** просмотр проектов, поиск, добавление и удаление записей, настройка Google Sync.
-- **Синхронизация через Google Drive (`drive.appdata`):** слияние изменений по UUID и `updated_at` (поддерживается мягкое удаление).
-- **Автоподключение агентов (`aimem install-rules`):** добавляет инструкции в `~/.claude/CLAUDE.md`, `~/.gemini/antigravity/AGENTS.md` и `~/.gemini/GEMINI.md`.
+- `crates/aimem-core` — общее ядро: SQLite + FTS5, определение проекта по Git remote, Google Drive sync, установщик правил.
+- `crates/aimem-cli` — быстрый CLI `aimem.exe` для агентов и терминала.
+- `app/` — десктопное приложение на Tauri 2 (`ai-memory.exe`) с треем и фоновой синхронизацией.
+- `ui/` — интерфейс приложения (`index.html`).
 
 ## Сборка
 
 ```powershell
-cargo test
-cargo build --release
+cargo test --workspace
+cargo build --release --workspace
 ```
 
-Готовый бинарник: `target/release/aimem.exe` (добавьте его в `PATH`).
+Готовые бинарники:
+- `target/release/aimem.exe` — CLI (добавьте в `PATH` для агентов).
+- `target/release/ai-memory.exe` — десктопное приложение с треем.
 
 ## Быстрый старт
 
@@ -26,25 +26,17 @@ cargo build --release
 # 1. Подключить правила для Claude Code и Antigravity
 aimem install-rules
 
-# 2. Добавить глобальное предпочтение
-aimem add "Всегда писать лаконичные тесты" --global --kind pref
+# 2. Запустить десктопное приложение (трей + автосинк)
+.\target\release\ai-memory.exe
 
-# 3. В папке любого проекта посмотреть контекст или добавить факт
+# 3. Использование из агентов / терминала
 aimem context
 aimem add "Используем SQLite WAL + FTS5" --kind arch --tags "sqlite,db" --agent antigravity
-
-# 4. Открыть Web UI
-aimem ui
+aimem search "FTS5"
 ```
 
 ## Настройка Google Drive Sync
 
 1. В Google Cloud Console включите **Google Drive API** и создайте OAuth-клиент типа **Desktop app** со scope `https://www.googleapis.com/auth/drive.appdata`.
-2. Укажите `Client ID` (и `Client Secret`, если нужен) в Web UI (`Настройки Google и агентов`) или через команду:
-   ```powershell
-   aimem auth --client-id "ВАШ_CLIENT_ID" --client-secret "ВАШ_SECRET"
-   ```
-3. Запускайте синхронизацию через кнопку в UI или командой:
-   ```powershell
-   aimem sync
-   ```
+2. Укажите `Client ID` (и `Client Secret`, если требуется) в окне **«Настройки Google и агентов»** внутри `AI Memory` и нажмите **«Подключить Google»** (или через CLI: `aimem auth --client-id ...`).
+3. Приложение в трее автоматически синхронизируется каждые 5 минут (или по кнопке в UI / трее / `aimem sync`).

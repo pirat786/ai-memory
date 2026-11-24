@@ -1,93 +1,62 @@
-mod db;
-mod project;
-mod rules;
-mod sync;
-mod ui;
-
+use aimem_core::db::{data_dir, load_config, save_config, Database};
+use aimem_core::project::detect_project;
+use aimem_core::rules::{install_global_rules, install_local_rules};
+use aimem_core::sync::{authenticate_google, sync_with_drive};
 use clap::{Parser, Subcommand};
-use db::{data_dir, load_config, save_config, Database};
-use project::detect_project;
-use rules::{install_global_rules, install_local_rules};
-use sync::{authenticate_google, sync_with_drive};
 
 #[derive(Parser)]
 #[command(name = "aimem", version, about = "Unified cross-agent AI memory without MCP")]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Commands>,
+    command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
     /// Print global + current project memory context (for AI agents)
     Context {
-        /// Optional project ID override
         #[arg(long)]
         project: Option<String>,
-        /// Max memories per section
         #[arg(long, default_value_t = 30)]
         limit: usize,
-        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
     /// Add a new memory entry
     Add {
-        /// Fact, decision, bug fix, or preference to remember
         content: String,
-        /// Memory kind: decision | arch | bug | pref | note
         #[arg(long, default_value = "note")]
         kind: String,
-        /// Comma-separated tags
         #[arg(long, default_value = "")]
         tags: String,
-        /// Source agent (antigravity, claude, cursor, user)
         #[arg(long, default_value = "user")]
         agent: String,
-        /// Store in global memory instead of current project
         #[arg(long)]
         global: bool,
-        /// Explicit project ID override
         #[arg(long)]
         project: Option<String>,
     },
     /// Full-text search across memories (FTS5)
     Search {
-        /// Search query
         query: String,
-        /// Restrict to current project (+ global)
         #[arg(long)]
         project_only: bool,
-        /// Max results
         #[arg(long, default_value_t = 20)]
         limit: usize,
-        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
     /// List projects or memories
     List {
-        /// Show all projects instead of memories
         #[arg(long)]
         projects: bool,
-        /// Filter by project ID
         #[arg(long)]
         project: Option<String>,
         #[arg(long, default_value_t = 30)]
         limit: usize,
     },
     /// Delete a memory entry by ID
-    Rm {
-        id: String,
-    },
-    /// Launch local Web UI
-    Ui {
-        #[arg(long, default_value_t = 4747)]
-        port: u16,
-        /// Do not auto-open browser
-        #[arg(long)]
-        no_open: bool,
-    },
+    Rm { id: String },
     /// Authenticate with Google Drive (drive.appdata)
     Auth {
         #[arg(long)]
@@ -99,7 +68,6 @@ enum Commands {
     Sync,
     /// Install instructions into Claude Code and Antigravity global/local rules
     InstallRules {
-        /// Also write AGENTS.md and CLAUDE.md in the current project
         #[arg(long)]
         local: bool,
     },
@@ -109,12 +77,7 @@ enum Commands {
 
 fn main() {
     let cli = Cli::parse();
-    let cmd = cli.command.unwrap_or(Commands::Ui {
-        port: 4747,
-        no_open: false,
-    });
-
-    if let Err(err) = run(cmd) {
+    if let Err(err) = run(cli.command) {
         eprintln!("Error: {err}");
         std::process::exit(1);
     }
@@ -257,9 +220,6 @@ fn run(cmd: Commands) -> Result<(), String> {
             } else {
                 println!("Not found: {id}");
             }
-        }
-        Commands::Ui { port, no_open } => {
-            ui::serve(port, !no_open)?;
         }
         Commands::Auth {
             client_id,

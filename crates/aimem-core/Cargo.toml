@@ -1,0 +1,19 @@
+[package]
+name = "aimem-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+flate2.workspace = true
+sha2.workspace = true
+base64.workspace = true
+url.workspace = true
+tiny_http.workspace = true
+ureq.workspace = true

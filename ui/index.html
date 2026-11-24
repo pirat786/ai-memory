@@ -359,6 +359,8 @@
   <div class="toast" id="toast"></div>
 
   <script>
+    const { invoke } = window.__TAURI__.core;
+    const { listen } = window.__TAURI__.event;
     let currentProjectId = 'all';
     let searchTimer = null;
 
@@ -369,18 +371,8 @@
       setTimeout(() => el.classList.remove('show'), 3200);
     }
 
-    async function api(path, opts = {}) {
-      const res = await fetch(path, {
-        headers: { 'Content-Type': 'application/json' },
-        ...opts,
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Request failed');
-      return data;
-    }
-
     async function loadStatus() {
-      const st = await api('/api/status');
+      const st = await invoke('get_status');
       const dot = document.getElementById('syncDot');
       const txt = document.getElementById('syncStatusText');
       if (st.google_connected) {
@@ -397,7 +389,7 @@
     }
 
     async function loadProjects() {
-      const projects = await api('/api/projects');
+      const projects = await invoke('list_projects');
       const list = document.getElementById('projectList');
       list.innerHTML = '';
 
@@ -429,10 +421,10 @@
 
     async function loadMemories() {
       const q = document.getElementById('searchInput').value.trim();
-      const params = new URLSearchParams();
-      if (currentProjectId !== 'all') params.set('project_id', currentProjectId);
-      if (q) params.set('q', q);
-      const items = await api('/api/memories?' + params.toString());
+      const items = await invoke('list_memories', {
+        projectId: currentProjectId === 'all' ? null : currentProjectId,
+        query: q || null,
+      });
       const box = document.getElementById('memoriesList');
       box.innerHTML = '';
 
@@ -469,16 +461,13 @@
     async function addMemory() {
       const content = document.getElementById('newContent').value.trim();
       if (!content) return toast('Введите текст записи');
-      const project_id = currentProjectId === 'all' ? 'global' : currentProjectId;
-      await api('/api/memories', {
-        method: 'POST',
-        body: JSON.stringify({
-          project_id,
-          kind: document.getElementById('newKind').value,
-          content,
-          tags: document.getElementById('newTags').value,
-          source_agent: document.getElementById('newAgent').value,
-        }),
+      const projectId = currentProjectId === 'all' ? 'global' : currentProjectId;
+      await invoke('add_memory', {
+        projectId,
+        kind: document.getElementById('newKind').value,
+        content,
+        tags: document.getElementById('newTags').value,
+        sourceAgent: document.getElementById('newAgent').value,
       });
       document.getElementById('newContent').value = '';
       document.getElementById('newTags').value = '';
@@ -488,26 +477,26 @@
     }
 
     async function deleteMemory(id) {
-      await api('/api/memories/' + id, { method: 'DELETE' });
+      await invoke('delete_memory', { id });
       toast('Удалено');
       await loadProjects();
       await loadMemories();
     }
 
     async function installRules() {
-      const res = await api('/api/rules/install', { method: 'POST' });
-      toast('Правила обновлены: ' + res.files.length + ' файл(а)');
+      const files = await invoke('install_rules');
+      toast('Правила обновлены: ' + files.length + ' файл(а)');
     }
 
     async function syncNow() {
       try {
-        const res = await api('/api/sync', { method: 'POST' });
+        const res = await invoke('sync_now');
         toast(`Синхронизировано (+${res.merged.memories_added} / ~${res.merged.memories_updated})`);
         await loadStatus();
         await loadProjects();
         await loadMemories();
       } catch (e) {
-        toast(e.message);
+        toast(String(e));
       }
     }
 
@@ -515,13 +504,10 @@
     function closeSettings() { document.getElementById('settingsModal').classList.remove('open'); }
 
     async function saveSettings() {
-      await api('/api/config', {
-        method: 'POST',
-        body: JSON.stringify({
-          device_name: document.getElementById('cfgDevice').value,
-          google_client_id: document.getElementById('cfgClientId').value,
-          google_client_secret: document.getElementById('cfgClientSecret').value || null,
-        }),
+      await invoke('save_settings', {
+        deviceName: document.getElementById('cfgDevice').value,
+        googleClientId: document.getElementById('cfgClientId').value,
+        googleClientSecret: document.getElementById('cfgClientSecret').value || null,
       });
       toast('Настройки сохранены');
       closeSettings();
@@ -531,11 +517,11 @@
     async function authGoogle() {
       await saveSettings();
       try {
-        await api('/api/auth/google', { method: 'POST' });
+        await invoke('auth_google');
         toast('Google Drive подключён!');
         await loadStatus();
       } catch (e) {
-        toast(e.message);
+        toast(String(e));
       }
     }
 
@@ -549,6 +535,11 @@
       await loadStatus();
       await loadProjects();
       await loadMemories();
+      await listen('memory-synced', async () => {
+        await loadStatus();
+        await loadProjects();
+        await loadMemories();
+      });
     })();
   </script>
 </body>

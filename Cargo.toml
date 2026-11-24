@@ -1,15 +1,13 @@
-[package]
-name = "ai-memory"
-version = "0.1.0"
+[workspace]
+resolver = "2"
+members = ["crates/aimem-core", "crates/aimem-cli", "app"]
+
+[workspace.package]
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
-description = "Unified cross-agent AI memory (CLI + Web UI + Google Drive sync) without MCP"
 
-[[bin]]
-name = "aimem"
-path = "src/main.rs"
-
-[dependencies]
+[workspace.dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -20,9 +18,11 @@ flate2 = "1"
 sha2 = "0.10"
 base64 = "0.22"
 url = "2"
-clap = { version = "4", features = ["derive"] }
 tiny_http = "0.12"
 ureq = { version = "2", features = ["json"] }
+clap = { version = "4", features = ["derive"] }
+
+aimem-core = { path = "crates/aimem-core" }
 
 [profile.release]
 opt-level = "s"
