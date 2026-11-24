@@ -296,7 +296,10 @@
         <span id="syncStatusText">Google Drive: не подключён</span>
       </div>
       <button id="googleActionBtn" class="primary" onclick="handleGoogleAction()">Подключить Google</button>
-      <button onclick="openSettings()">Имя ПК и настройки</button>
+      <div style="display:flex;gap:6px;">
+        <button style="flex:1;" onclick="openSettings()">Настройки</button>
+        <button class="danger" onclick="quitApp()">Выход</button>
+      </div>
     </div>
   </aside>
 
@@ -526,6 +529,7 @@
 
     function openSettings() { document.getElementById('settingsModal').classList.add('open'); }
     function closeSettings() { document.getElementById('settingsModal').classList.remove('open'); }
+    async function quitApp() { await invoke('quit_app'); }
 
     async function saveSettings() {
       await invoke('save_settings', {

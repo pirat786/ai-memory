@@ -186,6 +186,11 @@ async fn import_memories(projects_dir: Option<String>) -> Result<ImportReport, S
     .map_err(|e| e.to_string())?
 }
 
+#[tauri::command]
+fn quit_app(app: tauri::AppHandle) {
+    app.exit(0);
+}
+
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.show();
@@ -207,6 +212,7 @@ fn main() {
             sync_now,
             install_rules,
             import_memories,
+            quit_app,
         ])
         .setup(|app| {
             let open_item = MenuItem::with_id(app, "open", "Открыть AI Memory", true, None::<&str>)?;
