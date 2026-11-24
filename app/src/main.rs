@@ -61,6 +61,9 @@ fn list_projects() -> Result<Vec<ProjectWithCount>, String> {
             .list_memories(Some(&p.id), 10000)
             .map_err(|e| e.to_string())?
             .len();
+        if count == 0 && p.id != "global" {
+            continue;
+        }
         out.push(ProjectWithCount {
             id: p.id,
             name: p.name,

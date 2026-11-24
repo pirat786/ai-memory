@@ -98,7 +98,9 @@ pub fn import_all(db: &Database, projects_root: Option<&Path>) -> Result<ImportR
                     .file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("unknown");
-                let (pid, pname, remote) = resolve_claude_project_folder(folder_name);
+                let Some((pid, pname, remote)) = resolve_claude_project_folder(folder_name) else {
+                    continue;
+                };
 
                 if let Ok(files) = std::fs::read_dir(&mem_dir) {
                     for f in files.flatten() {
@@ -194,20 +196,19 @@ pub fn import_all(db: &Database, projects_root: Option<&Path>) -> Result<ImportR
     Ok(report)
 }
 
-fn resolve_claude_project_folder(encoded: &str) -> (String, String, Option<String>) {
-    // Claude encodes "C:\RABOTA\Cods\VAH" as "C--RABOTA-Cods-VAH"
+fn resolve_claude_project_folder(encoded: &str) -> Option<(String, String, Option<String>)> {
+    // Skip temporary Claude scratch workspaces
+    if encoded.contains("scratch-workspaces") || encoded.contains("AppData-") {
+        return None;
+    }
     if let Some(candidate) = decode_windows_claude_path(encoded) {
         if candidate.is_dir() {
             let detected = detect_project(Some(&candidate));
-            return (detected.id, detected.name, detected.git_remote);
+            return Some((detected.id, detected.name, detected.git_remote));
         }
     }
-    let short_name = encoded
-        .rsplit('-')
-        .find(|s| !s.is_empty())
-        .unwrap_or(encoded)
-        .to_string();
-    (format!("local/{}", short_name.to_lowercase()), short_name, None)
+    // Skip projects that no longer exist on disk
+    None
 }
 
 fn decode_windows_claude_path(encoded: &str) -> Option<PathBuf> {
