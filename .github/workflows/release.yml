@@ -128,7 +128,7 @@ jobs:
           AIMEM_GOOGLE_CLIENT_SECRET: ${{ secrets.AIMEM_GOOGLE_CLIENT_SECRET }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: tauri build --ci --config "$RUNNER_TEMP/tauri-release.json" -- --locked
+        run: tauri build --ci --config "$RUNNER_TEMP/tauri-release.json"
       - name: Collect platform artifacts
         shell: bash
         run: |
