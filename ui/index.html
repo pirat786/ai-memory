@@ -9,7 +9,10 @@
 <body>
   <aside>
     <div class="brand">
-      <h1>ai-memory</h1>
+      <div style="display:flex;align-items:baseline;gap:6px;">
+        <h1>ai-memory</h1>
+        <span id="appVersion" style="font-size:11px;color:var(--muted);"></span>
+      </div>
       <button id="langBtn" style="padding:2px 8px;font-size:11px;" onclick="toggleLang()">EN</button>
     </div>
     <div class="project-list" id="projectList"></div>
@@ -35,6 +38,16 @@
       <div class="search-box">
         <input id="searchInput" type="search" placeholder="Поиск по памяти (FTS5)..." oninput="debouncedLoadMemories()" />
       </div>
+      <select id="filterKind" onchange="resetAndLoadMemories()" style="max-width:130px;"></select>
+      <select id="filterAgent" onchange="resetAndLoadMemories()" style="max-width:120px;">
+        <option value="all">Все агенты</option>
+        <option value="user">user</option>
+        <option value="antigravity">antigravity</option>
+        <option value="claude">claude</option>
+        <option value="codex">codex</option>
+        <option value="cursor">cursor</option>
+        <option value="project">project</option>
+      </select>
       <button id="importBtn" onclick="importMemories()">Импорт памяти</button>
       <button id="updateBtn" class="primary" style="display:none;" onclick="installUpdate()">Обновить</button>
       <button id="newBtn" class="primary" onclick="document.getElementById('newContent').focus()">+ Новая запись</button>
@@ -50,6 +63,7 @@
             <option value="user">user</option>
             <option value="antigravity">antigravity</option>
             <option value="claude">claude</option>
+            <option value="codex">codex</option>
             <option value="cursor">cursor</option>
           </select>
           <button id="saveMemBtn" class="primary" onclick="addMemory()">Сохранить</button>
@@ -57,6 +71,7 @@
       </div>
 
       <div id="memoriesList" style="display:flex;flex-direction:column;gap:10px;"></div>
+      <button id="loadMoreBtn" style="display:none;align-self:center;margin-top:10px;" onclick="loadMoreMemories()">Загрузить ещё</button>
     </div>
   </main>
 
@@ -67,6 +82,14 @@
         <label id="cfgDeviceLabel">Имя этого ПК</label>
         <input id="cfgDevice" placeholder="DESKTOP-WORK" />
       </div>
+      <div class="field">
+        <label id="cfgScanDirsLabel">Папки проектов для импорта (по одной на строке)</label>
+        <textarea id="cfgScanDirs" rows="2" placeholder="C:\Projects" style="min-height:52px;"></textarea>
+      </div>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;margin-top:4px;">
+        <input id="cfgAutoSync" type="checkbox" style="width:auto;" />
+        <span id="cfgAutoSyncLabel">Автосинхронизация каждые 5 мин</span>
+      </label>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;margin-top:4px;">
         <input id="cfgAutostart" type="checkbox" style="width:auto;" />
         <span id="cfgAutostartLabel">Запускать вместе с Windows</span>

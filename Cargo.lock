@@ -32,7 +32,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-app"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aimem-core",
  "serde",
@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "aimem-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aimem-core",
  "clap",
@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "aimem-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",

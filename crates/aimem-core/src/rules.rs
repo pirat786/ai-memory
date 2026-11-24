@@ -101,12 +101,45 @@ pub fn ensure_aimem_in_path() -> bool {
         {
             return true;
         }
-        let script = format!(
-            "$p=[Environment]::GetEnvironmentVariable('Path','User'); if (-not $p) {{ $p='' }}; $parts=$p -split ';'; if ($parts -notcontains '{0}') {{ $next = if ($p.TrimEnd(';')) {{ \"$($p.TrimEnd(';'));{0}\" }} else {{ '{0}' }}; [Environment]::SetEnvironmentVariable('Path', $next, 'User') }}",
-            dir_str.replace('\'', "''")
-        );
-        let status = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
+        // Read User PATH via reg.exe (much faster than spawning powershell.exe)
+        let existing_user_path = std::process::Command::new("reg")
+            .args(["query", r"HKCU\Environment", "/v", "Path"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| {
+                let text = String::from_utf8_lossy(&o.stdout);
+                text.lines()
+                    .find(|l| l.contains("REG_"))
+                    .and_then(|l| l.split_once("REG_EXPAND_SZ").or_else(|| l.split_once("REG_SZ")))
+                    .map(|(_, val)| val.trim().to_string())
+            })
+            .unwrap_or_default();
+
+        if existing_user_path
+            .split(';')
+            .any(|p| p.trim().eq_ignore_ascii_case(&dir_str))
+        {
+            return true;
+        }
+
+        let next_path = if existing_user_path.trim().is_empty() {
+            dir_str
+        } else {
+            format!("{};{}", existing_user_path.trim_end_matches(';'), dir_str)
+        };
+        let status = std::process::Command::new("reg")
+            .args([
+                "add",
+                r"HKCU\Environment",
+                "/v",
+                "Path",
+                "/t",
+                "REG_EXPAND_SZ",
+                "/d",
+                &next_path,
+                "/f",
+            ])
             .status();
         return status.map(|s| s.success()).unwrap_or(false);
     }
@@ -114,5 +147,31 @@ pub fn ensure_aimem_in_path() -> bool {
     {
         let _ = dir;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upsert_rule_file_preserves_user_content_and_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!("aimem_rules_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("CLAUDE.md");
+
+        std::fs::write(&file, "# My Rules\nKeep it simple.\n").unwrap();
+        upsert_rule_file(&file).unwrap();
+        let first = std::fs::read_to_string(&file).unwrap();
+        assert!(first.contains("# My Rules\nKeep it simple."));
+        assert!(first.contains(START_MARKER));
+        assert!(first.contains(END_MARKER));
+
+        // Second run must not duplicate the block
+        upsert_rule_file(&file).unwrap();
+        let second = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(first, second);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

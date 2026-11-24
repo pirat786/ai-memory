@@ -5,6 +5,8 @@ use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
+use std::sync::Mutex;
+use std::time::Duration as StdDuration;
 use thiserror::Error;
 use tiny_http::{Response, Server};
 use url::Url;
@@ -12,6 +14,14 @@ use uuid::Uuid;
 
 const SYNC_FILENAME: &str = "ai-memory-sync.json.gz";
 const DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive.appdata";
+static SYNC_LOCK: Mutex<()> = Mutex::new(());
+
+fn http_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(StdDuration::from_secs(10))
+        .timeout(StdDuration::from_secs(30))
+        .build()
+}
 
 #[derive(Error, Debug)]
 pub enum SyncError {
@@ -56,6 +66,8 @@ struct DriveFileList {
 #[derive(Deserialize)]
 struct DriveFile {
     id: String,
+    #[serde(rename = "md5Checksum")]
+    md5_checksum: Option<String>,
 }
 
 pub fn resolve_client_creds(cfg: &AppConfig) -> Result<(String, Option<String>)> {
@@ -161,7 +173,9 @@ pub fn authenticate_google(cfg: &mut AppConfig) -> Result<()> {
         form.push(("client_secret", secret.as_str()));
     }
 
-    let token: TokenResponse = ureq::post("https://oauth2.googleapis.com/token")
+    let agent = http_agent();
+    let token: TokenResponse = agent
+        .post("https://oauth2.googleapis.com/token")
         .send_form(&form)
         .map_err(|e| SyncError::Http(e.to_string()))?
         .into_json()
@@ -178,6 +192,10 @@ pub fn authenticate_google(cfg: &mut AppConfig) -> Result<()> {
 }
 
 pub fn ensure_access_token(cfg: &mut AppConfig) -> Result<String> {
+    ensure_access_token_with_agent(&http_agent(), cfg)
+}
+
+fn ensure_access_token_with_agent(agent: &ureq::Agent, cfg: &mut AppConfig) -> Result<String> {
     if let (Some(tok), Some(exp_str)) = (&cfg.google_access_token, &cfg.google_token_expires_at) {
         if let Ok(exp) = DateTime::parse_from_rfc3339(exp_str) {
             if Utc::now() < exp.with_timezone(&Utc) {
@@ -201,7 +219,8 @@ pub fn ensure_access_token(cfg: &mut AppConfig) -> Result<String> {
         form.push(("client_secret", secret.as_str()));
     }
 
-    let token: TokenResponse = ureq::post("https://oauth2.googleapis.com/token")
+    let token: TokenResponse = agent
+        .post("https://oauth2.googleapis.com/token")
         .send_form(&form)
         .map_err(|e| SyncError::Http(e.to_string()))?
         .into_json()
@@ -215,18 +234,110 @@ pub fn ensure_access_token(cfg: &mut AppConfig) -> Result<String> {
 }
 
 pub fn sync_with_drive(db: &mut Database, cfg: &mut AppConfig) -> Result<SyncReport> {
-    let token = ensure_access_token(cfg)?;
-    let auth_header = format!("Bearer {token}");
+    let _guard = SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let agent = http_agent();
+    let mut token = ensure_access_token_with_agent(&agent, cfg)?;
+    let mut auth_header = format!("Bearer {token}");
 
-    let file_id = match cfg.drive_file_id.clone() {
-        Some(id) => Some(id),
-        None => find_drive_file_id(&auth_header)?,
+    let (mut file_id, mut remote_md5) = match cfg.drive_file_id.clone() {
+        Some(id) => match get_drive_file_meta(&agent, &auth_header, &id) {
+            Ok(Some(f)) => (Some(f.id), f.md5_checksum),
+            Ok(None) => (None, None),
+            Err(SyncError::Http(msg)) if msg.contains("401") => {
+                cfg.google_access_token = None;
+                token = ensure_access_token_with_agent(&agent, cfg)?;
+                auth_header = format!("Bearer {token}");
+                match get_drive_file_meta(&agent, &auth_header, &id)? {
+                    Some(f) => (Some(f.id), f.md5_checksum),
+                    None => (None, None),
+                }
+            }
+            Err(e) => return Err(e),
+        },
+        None => match find_drive_file(&agent, &auth_header) {
+            Ok(Some(f)) => (Some(f.id), f.md5_checksum),
+            Ok(None) => (None, None),
+            Err(SyncError::Http(msg)) if msg.contains("401") => {
+                cfg.google_access_token = None;
+                token = ensure_access_token_with_agent(&agent, cfg)?;
+                auth_header = format!("Bearer {token}");
+                match find_drive_file(&agent, &auth_header)? {
+                    Some(f) => (Some(f.id), f.md5_checksum),
+                    None => (None, None),
+                }
+            }
+            Err(e) => return Err(e),
+        },
     };
+
+    let local_max_ts = db.max_updated_at()?;
+    let local_unchanged = match (&local_max_ts, &cfg.last_synced_local_ts) {
+        (Some(cur), Some(prev)) => cur <= prev,
+        (None, Some(_)) => true,
+        _ => false,
+    };
+    let remote_unchanged = file_id.is_some()
+        && remote_md5.is_some()
+        && remote_md5 == cfg.last_remote_md5;
+
+    if local_unchanged && remote_unchanged {
+        let now = Utc::now().to_rfc3339();
+        cfg.last_sync_at = Some(now.clone());
+        save_config(cfg)?;
+        return Ok(SyncReport {
+            merged: MergeStats::default(),
+            uploaded_memories: 0,
+            uploaded_projects: 0,
+            synced_at: now,
+        });
+    }
 
     let mut merged = MergeStats::default();
     if let Some(ref fid) = file_id {
-        if let Some(remote_snap) = download_snapshot(&auth_header, fid)? {
-            merged = db.merge_snapshot(&remote_snap)?;
+        if !remote_unchanged {
+            if let Some(remote_snap) = download_snapshot(&agent, &auth_header, fid)? {
+                merged = db.merge_snapshot(&remote_snap)?;
+            } else {
+                file_id = None;
+                remote_md5 = None;
+                cfg.drive_file_id = None;
+            }
+        }
+    }
+
+    // Skip upload if nothing changed locally and remote already matches
+    let local_after_merge = db.max_updated_at()?;
+    let local_still_unchanged = match (&local_after_merge, &cfg.last_synced_local_ts) {
+        (Some(cur), Some(prev)) => cur <= prev,
+        (None, _) => true,
+        _ => false,
+    };
+    if file_id.is_some() && local_still_unchanged && merged.memories_added == 0 && merged.memories_updated == 0 && merged.projects_merged == 0 {
+        let now = Utc::now().to_rfc3339();
+        cfg.drive_file_id = file_id;
+        cfg.last_remote_md5 = remote_md5;
+        cfg.last_synced_local_ts = local_after_merge;
+        cfg.last_sync_at = Some(now.clone());
+        save_config(cfg)?;
+        return Ok(SyncReport {
+            merged,
+            uploaded_memories: 0,
+            uploaded_projects: 0,
+            synced_at: now,
+        });
+    }
+
+    // Re-check remote md5 right before upload to avoid overwriting concurrent changes from another PC
+    if let Some(ref fid) = file_id {
+        if let Ok(Some(latest_meta)) = get_drive_file_meta(&agent, &auth_header, fid) {
+            if latest_meta.md5_checksum != remote_md5 {
+                if let Some(remote_snap) = download_snapshot(&agent, &auth_header, fid)? {
+                    let extra = db.merge_snapshot(&remote_snap)?;
+                    merged.projects_merged += extra.projects_merged;
+                    merged.memories_added += extra.memories_added;
+                    merged.memories_updated += extra.memories_updated;
+                }
+            }
         }
     }
 
@@ -239,10 +350,12 @@ pub fn sync_with_drive(db: &mut Database, cfg: &mut AppConfig) -> Result<SyncRep
     let uploaded_projects = local_snap.projects.len();
 
     let gz_bytes = gzip_json(&local_snap)?;
-    let new_file_id = upload_snapshot(&auth_header, file_id.as_deref(), &gz_bytes)?;
+    let uploaded_file = upload_snapshot(&agent, &auth_header, file_id.as_deref(), &gz_bytes)?;
 
     let now = Utc::now().to_rfc3339();
-    cfg.drive_file_id = Some(new_file_id);
+    cfg.drive_file_id = Some(uploaded_file.id);
+    cfg.last_remote_md5 = uploaded_file.md5_checksum;
+    cfg.last_synced_local_ts = db.max_updated_at()?;
     cfg.last_sync_at = Some(now.clone());
     save_config(cfg)?;
 
@@ -254,27 +367,40 @@ pub fn sync_with_drive(db: &mut Database, cfg: &mut AppConfig) -> Result<SyncRep
     })
 }
 
-fn find_drive_file_id(auth_header: &str) -> Result<Option<String>> {
+fn find_drive_file(agent: &ureq::Agent, auth_header: &str) -> Result<Option<DriveFile>> {
     let mut url = Url::parse("https://www.googleapis.com/drive/v3/files")
         .map_err(|e| SyncError::Http(e.to_string()))?;
     url.query_pairs_mut()
         .append_pair("spaces", "appDataFolder")
         .append_pair("q", &format!("name='{SYNC_FILENAME}' and trashed=false"))
-        .append_pair("fields", "files(id)");
+        .append_pair("fields", "files(id,md5Checksum)");
 
-    let list: DriveFileList = ureq::get(url.as_str())
+    let list: DriveFileList = agent
+        .get(url.as_str())
         .set("Authorization", auth_header)
         .call()
         .map_err(|e| SyncError::Http(e.to_string()))?
         .into_json()
         .map_err(|e| SyncError::Http(e.to_string()))?;
 
-    Ok(list.files.into_iter().next().map(|f| f.id))
+    Ok(list.files.into_iter().next())
 }
 
-fn download_snapshot(auth_header: &str, file_id: &str) -> Result<Option<SyncSnapshot>> {
+fn get_drive_file_meta(agent: &ureq::Agent, auth_header: &str, file_id: &str) -> Result<Option<DriveFile>> {
+    let url = format!("https://www.googleapis.com/drive/v3/files/{file_id}?fields=id,md5Checksum,trashed");
+    match agent.get(&url).set("Authorization", auth_header).call() {
+        Ok(r) => {
+            let file: DriveFile = r.into_json().map_err(|e| SyncError::Http(e.to_string()))?;
+            Ok(Some(file))
+        }
+        Err(ureq::Error::Status(404, _)) => Ok(None),
+        Err(e) => Err(SyncError::Http(e.to_string())),
+    }
+}
+
+fn download_snapshot(agent: &ureq::Agent, auth_header: &str, file_id: &str) -> Result<Option<SyncSnapshot>> {
     let url = format!("https://www.googleapis.com/drive/v3/files/{file_id}?alt=media");
-    let resp = match ureq::get(&url).set("Authorization", auth_header).call() {
+    let resp = match agent.get(&url).set("Authorization", auth_header).call() {
         Ok(r) => r,
         Err(ureq::Error::Status(404, _)) => return Ok(None),
         Err(e) => return Err(SyncError::Http(e.to_string())),
@@ -292,7 +418,12 @@ fn download_snapshot(auth_header: &str, file_id: &str) -> Result<Option<SyncSnap
     Ok(Some(snap))
 }
 
-fn upload_snapshot(auth_header: &str, existing_id: Option<&str>, gz_bytes: &[u8]) -> Result<String> {
+fn upload_snapshot(
+    agent: &ureq::Agent,
+    auth_header: &str,
+    existing_id: Option<&str>,
+    gz_bytes: &[u8],
+) -> Result<DriveFile> {
     let boundary = format!("aimem_boundary_{}", Uuid::new_v4().simple());
     let metadata = if existing_id.is_some() {
         serde_json::json!({ "name": SYNC_FILENAME }).to_string()
@@ -311,15 +442,17 @@ fn upload_snapshot(auth_header: &str, existing_id: Option<&str>, gz_bytes: &[u8]
     let content_type = format!("multipart/related; boundary={boundary}");
 
     let resp = if let Some(fid) = existing_id {
-        let url = format!("https://www.googleapis.com/upload/drive/v3/files/{fid}?uploadType=multipart");
-        ureq::patch(&url)
+        let url = format!("https://www.googleapis.com/upload/drive/v3/files/{fid}?uploadType=multipart&fields=id,md5Checksum");
+        agent
+            .patch(&url)
             .set("Authorization", auth_header)
             .set("Content-Type", &content_type)
             .send_bytes(&body)
             .map_err(|e| SyncError::Http(e.to_string()))?
     } else {
-        let url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart";
-        ureq::post(url)
+        let url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,md5Checksum";
+        agent
+            .post(url)
             .set("Authorization", auth_header)
             .set("Content-Type", &content_type)
             .send_bytes(&body)
@@ -327,7 +460,7 @@ fn upload_snapshot(auth_header: &str, existing_id: Option<&str>, gz_bytes: &[u8]
     };
 
     let file: DriveFile = resp.into_json().map_err(|e| SyncError::Http(e.to_string()))?;
-    Ok(file.id)
+    Ok(file)
 }
 
 fn gzip_json(snap: &SyncSnapshot) -> Result<Vec<u8>> {

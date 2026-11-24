@@ -1,7 +1,9 @@
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -13,6 +15,8 @@ pub enum DbError {
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("{0}")]
+    InvalidInput(String),
 }
 
 pub type Result<T> = std::result::Result<T, DbError>;
@@ -56,7 +60,11 @@ pub struct MergeStats {
     pub memories_updated: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
     pub google_client_id: Option<String>,
@@ -66,10 +74,35 @@ pub struct AppConfig {
     pub google_token_expires_at: Option<String>,
     pub drive_file_id: Option<String>,
     pub last_sync_at: Option<String>,
+    pub last_remote_md5: Option<String>,
+    pub last_synced_local_ts: Option<String>,
     pub device_name: Option<String>,
+    #[serde(default = "default_true")]
     pub auto_sync: bool,
     pub auto_import_done: bool,
     pub autostart_configured: bool,
+    pub scan_dirs: Vec<String>,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            google_client_id: None,
+            google_client_secret: None,
+            google_refresh_token: None,
+            google_access_token: None,
+            google_token_expires_at: None,
+            drive_file_id: None,
+            last_sync_at: None,
+            last_remote_md5: None,
+            last_synced_local_ts: None,
+            device_name: None,
+            auto_sync: true,
+            auto_import_done: false,
+            autostart_configured: false,
+            scan_dirs: Vec::new(),
+        }
+    }
 }
 
 pub fn data_dir() -> PathBuf {
@@ -111,7 +144,10 @@ pub fn save_config(cfg: &AppConfig) -> Result<()> {
     let dir = data_dir();
     std::fs::create_dir_all(&dir)?;
     let json = serde_json::to_string_pretty(cfg)?;
-    std::fs::write(config_path(), json)?;
+    let target = config_path();
+    let tmp = dir.join(format!("config.json.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, &target)?;
     Ok(())
 }
 
@@ -128,7 +164,9 @@ impl Database {
 
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let db = Self { conn };
         db.migrate()?;
@@ -136,6 +174,13 @@ impl Database {
     }
 
     fn migrate(&self) -> Result<()> {
+        let version: i64 = self
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version >= 1 {
+            return Ok(());
+        }
+
         self.conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS projects (
@@ -196,6 +241,7 @@ impl Database {
              VALUES ('global', 'Global Preferences', NULL, 'Shared user preferences, style, and cross-project rules.', ?1, ?1)",
             params![now],
         )?;
+        self.conn.pragma_update(None, "user_version", 1)?;
         Ok(())
     }
 
@@ -255,6 +301,90 @@ impl Database {
                 updated_at: row.get(5)?,
             })
         })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(DbError::from)
+    }
+
+    pub fn list_projects_with_counts(&self) -> Result<Vec<(Project, usize)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT p.id, p.name, p.git_remote, p.summary, p.created_at, p.updated_at,
+                    COUNT(m.id) AS mem_count
+             FROM projects p
+             LEFT JOIN memories m ON m.project_id = p.id AND m.deleted_at IS NULL
+             GROUP BY p.id
+             ORDER BY CASE WHEN p.id = 'global' THEN 0 ELSE 1 END, p.updated_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let count: i64 = row.get(6)?;
+            Ok((
+                Project {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    git_remote: row.get(2)?,
+                    summary: row.get(3)?,
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
+                },
+                count.max(0) as usize,
+            ))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(DbError::from)
+    }
+
+    pub fn count_memories(&self) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE deleted_at IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as usize)
+    }
+
+    pub fn max_updated_at(&self) -> Result<Option<String>> {
+        let mem_max: Option<String> = self
+            .conn
+            .query_row("SELECT MAX(updated_at) FROM memories", [], |row| row.get(0))?;
+        let proj_max: Option<String> = self
+            .conn
+            .query_row("SELECT MAX(updated_at) FROM projects", [], |row| row.get(0))?;
+        Ok(match (mem_max, proj_max) {
+            (Some(a), Some(b)) => Some(if a >= b { a } else { b }),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        })
+    }
+
+    pub fn list_memories_filtered(
+        &self,
+        project_id: Option<&str>,
+        kind: Option<&str>,
+        agent: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Memory>> {
+        let mut sql = String::from(
+            "SELECT id, project_id, kind, content, tags, source_agent, created_at, updated_at, deleted_at
+             FROM memories WHERE deleted_at IS NULL",
+        );
+        let mut owned_params: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(pid) = project_id {
+            sql.push_str(" AND project_id = ?");
+            owned_params.push(pid.to_string().into());
+        }
+        if let Some(k) = kind.filter(|s| !s.trim().is_empty() && *s != "all") {
+            sql.push_str(" AND kind = ?");
+            owned_params.push(normalize_kind(k).into());
+        }
+        if let Some(a) = agent.filter(|s| !s.trim().is_empty() && *s != "all") {
+            sql.push_str(" AND source_agent = ?");
+            owned_params.push(a.trim().to_string().into());
+        }
+        sql.push_str(" ORDER BY updated_at DESC LIMIT ? OFFSET ?");
+        owned_params.push((limit as i64).into());
+        owned_params.push((offset as i64).into());
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(owned_params), row_to_memory)?;
         rows.collect::<std::result::Result<Vec<_>, _>>().map_err(DbError::from)
     }
 
@@ -332,6 +462,76 @@ impl Database {
         Ok(changed > 0)
     }
 
+    fn resolve_active_memory_id(&self, id_or_prefix: &str) -> Result<Option<String>> {
+        let trimmed = id_or_prefix.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        let exact: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM memories WHERE id = ?1 AND deleted_at IS NULL",
+                params![trimmed],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exact.is_some() {
+            return Ok(exact);
+        }
+        if trimmed.len() < 4 {
+            return Err(DbError::InvalidInput(
+                "ID prefix must be at least 4 characters.".to_string(),
+            ));
+        }
+        let pattern = format!("{}%", escape_like(trimmed));
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM memories WHERE deleted_at IS NULL AND id LIKE ?1 ESCAPE '\\' LIMIT 5",
+        )?;
+        let matches: Vec<String> = stmt
+            .query_map(params![pattern], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        match matches.len() {
+            0 => Ok(None),
+            1 => Ok(matches.into_iter().next()),
+            _ => Err(DbError::InvalidInput(format!(
+                "Ambiguous ID prefix '{trimmed}': matches {} memories (e.g. {}). Provide more characters.",
+                matches.len(),
+                matches.iter().map(|s| s.get(..8).unwrap_or(s)).collect::<Vec<_>>().join(", ")
+            ))),
+        }
+    }
+
+    pub fn update_memory_by_prefix(
+        &self,
+        id_or_prefix: &str,
+        kind: Option<&str>,
+        content: Option<&str>,
+        tags: Option<&str>,
+    ) -> Result<Option<Memory>> {
+        let Some(full_id) = self.resolve_active_memory_id(id_or_prefix)? else {
+            return Ok(None);
+        };
+        self.update_memory(&full_id, kind, content, tags)
+    }
+
+    pub fn soft_delete_memory_by_prefix(&self, id_or_prefix: &str) -> Result<Option<String>> {
+        let Some(full_id) = self.resolve_active_memory_id(id_or_prefix)? else {
+            return Ok(None);
+        };
+        self.soft_delete_memory(&full_id)?;
+        Ok(Some(full_id))
+    }
+
+    pub fn gc_deleted(&self, older_than_days: i64) -> Result<usize> {
+        let cutoff = (Utc::now() - ChronoDuration::days(older_than_days.max(0))).to_rfc3339();
+        let removed = self.conn.execute(
+            "DELETE FROM memories WHERE deleted_at IS NOT NULL AND deleted_at < ?1",
+            params![cutoff],
+        )?;
+        Ok(removed)
+    }
+
     pub fn list_memories(&self, project_id: Option<&str>, limit: usize) -> Result<Vec<Memory>> {
         let limit_i = limit as i64;
         let mut results = Vec::new();
@@ -372,52 +572,71 @@ impl Database {
         let limit_i = limit as i64;
         let mut results = Vec::new();
 
-        if let Some(pid) = project_id {
-            let mut stmt = self.conn.prepare(
-                "SELECT m.id, m.project_id, m.kind, m.content, m.tags, m.source_agent, m.created_at, m.updated_at, m.deleted_at
-                 FROM memories_fts f
-                 JOIN memories m ON m.rowid = f.rowid
-                 WHERE memories_fts MATCH ?1 AND m.deleted_at IS NULL AND (m.project_id = ?2 OR m.project_id = 'global')
-                 ORDER BY bm25(memories_fts), m.updated_at DESC
-                 LIMIT ?3",
-            )?;
-            let rows = stmt.query_map(params![fts_query, pid, limit_i], row_to_memory);
-            if let Ok(mapped) = rows {
-                for r in mapped {
-                    results.push(r?);
+        if !fts_query.is_empty() {
+            if let Some(pid) = project_id {
+                let mut stmt = self.conn.prepare(
+                    "SELECT m.id, m.project_id, m.kind, m.content, m.tags, m.source_agent, m.created_at, m.updated_at, m.deleted_at
+                     FROM memories_fts f
+                     JOIN memories m ON m.rowid = f.rowid
+                     WHERE memories_fts MATCH ?1 AND m.deleted_at IS NULL AND (m.project_id = ?2 OR m.project_id = 'global')
+                     ORDER BY bm25(memories_fts), m.updated_at DESC
+                     LIMIT ?3",
+                )?;
+                let rows = stmt.query_map(params![fts_query, pid, limit_i], row_to_memory);
+                if let Ok(mapped) = rows {
+                    for r in mapped {
+                        results.push(r?);
+                    }
+                    return Ok(results);
                 }
-                return Ok(results);
-            }
-        } else {
-            let mut stmt = self.conn.prepare(
-                "SELECT m.id, m.project_id, m.kind, m.content, m.tags, m.source_agent, m.created_at, m.updated_at, m.deleted_at
-                 FROM memories_fts f
-                 JOIN memories m ON m.rowid = f.rowid
-                 WHERE memories_fts MATCH ?1 AND m.deleted_at IS NULL
-                 ORDER BY bm25(memories_fts), m.updated_at DESC
-                 LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(params![fts_query, limit_i], row_to_memory);
-            if let Ok(mapped) = rows {
-                for r in mapped {
-                    results.push(r?);
+            } else {
+                let mut stmt = self.conn.prepare(
+                    "SELECT m.id, m.project_id, m.kind, m.content, m.tags, m.source_agent, m.created_at, m.updated_at, m.deleted_at
+                     FROM memories_fts f
+                     JOIN memories m ON m.rowid = f.rowid
+                     WHERE memories_fts MATCH ?1 AND m.deleted_at IS NULL
+                     ORDER BY bm25(memories_fts), m.updated_at DESC
+                     LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(params![fts_query, limit_i], row_to_memory);
+                if let Ok(mapped) = rows {
+                    for r in mapped {
+                        results.push(r?);
+                    }
+                    return Ok(results);
                 }
-                return Ok(results);
             }
         }
 
-        // Fallback LIKE search if FTS query syntax had special characters
-        let like = format!("%{trimmed}%");
-        let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, kind, content, tags, source_agent, created_at, updated_at, deleted_at
-             FROM memories
-             WHERE deleted_at IS NULL AND (content LIKE ?1 OR tags LIKE ?1)
-             ORDER BY updated_at DESC
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![like, limit_i], row_to_memory)?;
-        for r in rows {
-            results.push(r?);
+        // Fallback LIKE search when query has only special chars or FTS syntax failed
+        let like = format!("%{}%", escape_like(trimmed));
+        if let Some(pid) = project_id {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, project_id, kind, content, tags, source_agent, created_at, updated_at, deleted_at
+                 FROM memories
+                 WHERE deleted_at IS NULL
+                   AND (project_id = ?2 OR project_id = 'global')
+                   AND (content LIKE ?1 ESCAPE '\\' OR tags LIKE ?1 ESCAPE '\\')
+                 ORDER BY updated_at DESC
+                 LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(params![like, pid, limit_i], row_to_memory)?;
+            for r in rows {
+                results.push(r?);
+            }
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, project_id, kind, content, tags, source_agent, created_at, updated_at, deleted_at
+                 FROM memories
+                 WHERE deleted_at IS NULL
+                   AND (content LIKE ?1 ESCAPE '\\' OR tags LIKE ?1 ESCAPE '\\')
+                 ORDER BY updated_at DESC
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![like, limit_i], row_to_memory)?;
+            for r in rows {
+                results.push(r?);
+            }
         }
         Ok(results)
     }
@@ -445,51 +664,58 @@ impl Database {
         let tx = self.conn.transaction()?;
         let mut stats = MergeStats::default();
 
-        for p in &snap.projects {
-            let local_updated: Option<String> = tx
-                .query_row(
-                    "SELECT updated_at FROM projects WHERE id = ?1",
-                    params![p.id],
-                    |row| row.get(0),
-                )
-                .optional()?;
+        let existing_projects: HashMap<String, String> = {
+            let mut stmt = tx.prepare("SELECT id, updated_at FROM projects")?;
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+            rows.collect::<std::result::Result<HashMap<_, _>, _>>()?
+        };
 
-            match local_updated {
-                None => {
-                    tx.execute(
-                        "INSERT INTO projects (id, name, git_remote, summary, created_at, updated_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                        params![p.id, p.name, p.git_remote, p.summary, p.created_at, p.updated_at],
-                    )?;
-                    stats.projects_merged += 1;
+        {
+            let mut ins_proj = tx.prepare_cached(
+                "INSERT INTO projects (id, name, git_remote, summary, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            let mut upd_proj = tx.prepare_cached(
+                "UPDATE projects SET name = ?1, git_remote = COALESCE(?2, git_remote), summary = ?3, updated_at = ?4
+                 WHERE id = ?5",
+            )?;
+
+            for p in &snap.projects {
+                match existing_projects.get(&p.id) {
+                    None => {
+                        ins_proj.execute(params![p.id, p.name, p.git_remote, p.summary, p.created_at, p.updated_at])?;
+                        stats.projects_merged += 1;
+                    }
+                    Some(ts) if p.updated_at > *ts => {
+                        upd_proj.execute(params![p.name, p.git_remote, p.summary, p.updated_at, p.id])?;
+                        stats.projects_merged += 1;
+                    }
+                    _ => {}
                 }
-                Some(ts) if p.updated_at > ts => {
-                    tx.execute(
-                        "UPDATE projects SET name = ?1, git_remote = COALESCE(?2, git_remote), summary = ?3, updated_at = ?4
-                         WHERE id = ?5",
-                        params![p.name, p.git_remote, p.summary, p.updated_at, p.id],
-                    )?;
-                    stats.projects_merged += 1;
-                }
-                _ => {}
             }
         }
 
-        for m in &snap.memories {
-            let local_updated: Option<String> = tx
-                .query_row(
-                    "SELECT updated_at FROM memories WHERE id = ?1",
-                    params![m.id],
-                    |row| row.get(0),
-                )
-                .optional()?;
+        let existing_memories: HashMap<String, String> = {
+            let mut stmt = tx.prepare("SELECT id, updated_at FROM memories")?;
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+            rows.collect::<std::result::Result<HashMap<_, _>, _>>()?
+        };
 
-            match local_updated {
-                None => {
-                    tx.execute(
-                        "INSERT INTO memories (id, project_id, kind, content, tags, source_agent, created_at, updated_at, deleted_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                        params![
+        {
+            let mut ins_mem = tx.prepare_cached(
+                "INSERT INTO memories (id, project_id, kind, content, tags, source_agent, created_at, updated_at, deleted_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?;
+            let mut upd_mem = tx.prepare_cached(
+                "UPDATE memories
+                 SET project_id = ?1, kind = ?2, content = ?3, tags = ?4, source_agent = ?5, updated_at = ?6, deleted_at = ?7
+                 WHERE id = ?8",
+            )?;
+
+            for m in &snap.memories {
+                match existing_memories.get(&m.id) {
+                    None => {
+                        ins_mem.execute(params![
                             m.id,
                             m.project_id,
                             m.kind,
@@ -499,16 +725,11 @@ impl Database {
                             m.created_at,
                             m.updated_at,
                             m.deleted_at
-                        ],
-                    )?;
-                    stats.memories_added += 1;
-                }
-                Some(ts) if m.updated_at > ts => {
-                    tx.execute(
-                        "UPDATE memories
-                         SET project_id = ?1, kind = ?2, content = ?3, tags = ?4, source_agent = ?5, updated_at = ?6, deleted_at = ?7
-                         WHERE id = ?8",
-                        params![
+                        ])?;
+                        stats.memories_added += 1;
+                    }
+                    Some(ts) if m.updated_at > *ts => {
+                        upd_mem.execute(params![
                             m.project_id,
                             m.kind,
                             m.content,
@@ -517,11 +738,11 @@ impl Database {
                             m.updated_at,
                             m.deleted_at,
                             m.id
-                        ],
-                    )?;
-                    stats.memories_updated += 1;
+                        ])?;
+                        stats.memories_updated += 1;
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
 
@@ -554,6 +775,17 @@ pub fn normalize_kind(kind: &str) -> String {
     }
 }
 
+fn escape_like(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn build_fts_query(raw: &str) -> String {
     raw.split_whitespace()
         .map(|w| {
@@ -578,7 +810,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("aimem_test_{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
 
-        let mut db1 = Database::open(&dir.join("db1.db")).unwrap();
+        let db1 = Database::open(&dir.join("db1.db")).unwrap();
         let proj = db1
             .ensure_project("github.com/user/demo", "demo", Some("https://github.com/user/demo.git"))
             .unwrap();
@@ -603,6 +835,23 @@ mod tests {
         let stats2 = db2.merge_snapshot(&snap2).unwrap();
         assert_eq!(stats2.memories_updated, 1);
         assert_eq!(db2.list_memories(Some(&proj.id), 10).unwrap().len(), 0);
+
+        // Test count_memories, list_projects_with_counts, prefix delete, and LIKE fallback filter
+        let m2 = db1.add_memory(&proj.id, "note", "C++ & Rust % special", "", "user").unwrap();
+        let other = db1.ensure_project("local/other", "other", None).unwrap();
+        db1.add_memory(&other.id, "note", "C++ % other project", "", "user").unwrap();
+
+        assert_eq!(db1.count_memories().unwrap(), 3);
+        let with_counts = db1.list_projects_with_counts().unwrap();
+        assert_eq!(with_counts.iter().find(|(p, _)| p.id == proj.id).unwrap().1, 1);
+
+        let special_hits = db1.search_memories("%", Some(&proj.id), 10).unwrap();
+        assert_eq!(special_hits.len(), 1);
+        assert_eq!(special_hits[0].id, m2.id);
+
+        let prefix = &m2.id[..8];
+        assert_eq!(db1.soft_delete_memory_by_prefix(prefix).unwrap(), Some(m2.id));
+        assert_eq!(db1.count_memories().unwrap(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

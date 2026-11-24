@@ -1,11 +1,48 @@
-use crate::db::{normalize_kind, Database};
+use crate::db::{load_config, normalize_kind, Database};
 use crate::project::detect_project;
 use crate::rules::home_dir;
 use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 const OUR_START: &str = "<!-- AI-MEMORY-START -->";
 const OUR_END: &str = "<!-- AI-MEMORY-END -->";
+
+struct ImportCtx<'a> {
+    db: &'a Database,
+    report: ImportReport,
+    touched_projects: HashSet<String>,
+    seen_cache: HashMap<String, HashSet<String>>,
+}
+
+impl<'a> ImportCtx<'a> {
+    fn new(db: &'a Database) -> Self {
+        Self {
+            db,
+            report: ImportReport::default(),
+            touched_projects: HashSet::new(),
+            seen_cache: HashMap::new(),
+        }
+    }
+
+    fn is_duplicate(&mut self, project_id: &str, content: &str) -> Result<bool, String> {
+        if !self.seen_cache.contains_key(project_id) {
+            let existing = self
+                .db
+                .list_memories(Some(project_id), 10000)
+                .map_err(|e| e.to_string())?;
+            let set = existing.into_iter().map(|m| m.content.trim().to_string()).collect();
+            self.seen_cache.insert(project_id.to_string(), set);
+        }
+        let set = self.seen_cache.get_mut(project_id).unwrap();
+        let trimmed = content.trim();
+        if set.contains(trimmed) {
+            return Ok(true);
+        }
+        set.insert(trimmed.to_string());
+        Ok(false)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct ImportReport {
@@ -15,14 +52,37 @@ pub struct ImportReport {
     pub memories_skipped_duplicate: usize,
 }
 
+fn default_scan_roots(home: &Path) -> Vec<PathBuf> {
+    let cfg = load_config();
+    if !cfg.scan_dirs.is_empty() {
+        return cfg
+            .scan_dirs
+            .into_iter()
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .collect();
+    }
+    let mut candidates = vec![
+        home.join("Projects"),
+        home.join("Cods"),
+        home.join("dev"),
+        home.join("src"),
+    ];
+    #[cfg(target_os = "windows")]
+    candidates.push(PathBuf::from(r"C:\RABOTA\Cods"));
+    candidates.into_iter().filter(|p| p.is_dir()).collect()
+}
+
 pub fn import_all(db: &Database, projects_root: Option<&Path>) -> Result<ImportReport, String> {
-    let mut report = ImportReport::default();
-    let mut touched_projects = std::collections::HashSet::new();
-    let default_cods = Path::new(r"C:\RABOTA\Cods");
-    let effective_root = projects_root.or_else(|| if default_cods.is_dir() { Some(default_cods) } else { None });
+    let mut ctx = ImportCtx::new(db);
+    let home = home_dir();
+    let scan_roots: Vec<PathBuf> = match projects_root {
+        Some(root) if root.is_dir() => vec![root.to_path_buf()],
+        Some(_) => Vec::new(),
+        None => default_scan_roots(&home),
+    };
 
     // 1. Global rule/memory files across Claude, Antigravity/Gemini, Codex, Cursor
-    let home = home_dir();
     for (path, agent) in [
         (home.join(".claude").join("CLAUDE.md"), "claude"),
         (home.join(".gemini").join("GEMINI.md"), "antigravity"),
@@ -30,7 +90,7 @@ pub fn import_all(db: &Database, projects_root: Option<&Path>) -> Result<ImportR
         (home.join(".codex").join("AGENTS.md"), "codex"),
     ] {
         if path.is_file() {
-            import_markdown_file(db, &path, "global", "Global Preferences", None, agent, "pref", &mut report, &mut touched_projects)?;
+            import_markdown_file(&mut ctx, &path, "global", "Global Preferences", None, agent, "pref")?;
         }
     }
 
@@ -40,7 +100,7 @@ pub fn import_all(db: &Database, projects_root: Option<&Path>) -> Result<ImportR
             for f in files.flatten() {
                 let p = f.path();
                 if p.extension().and_then(|e| e.to_str()) == Some("md") {
-                    import_markdown_file(db, &p, "global", "Global Preferences", None, "codex", "note", &mut report, &mut touched_projects)?;
+                    import_markdown_file(&mut ctx, &p, "global", "Global Preferences", None, "codex", "note")?;
                 }
             }
         }
@@ -53,7 +113,7 @@ pub fn import_all(db: &Database, projects_root: Option<&Path>) -> Result<ImportR
                 let p = f.path();
                 let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
                 if ext == "md" || ext == "mdc" {
-                    import_markdown_file(db, &p, "global", "Global Preferences", None, "cursor", "pref", &mut report, &mut touched_projects)?;
+                    import_markdown_file(&mut ctx, &p, "global", "Global Preferences", None, "cursor", "pref")?;
                 }
             }
         }
@@ -66,13 +126,13 @@ pub fn import_all(db: &Database, projects_root: Option<&Path>) -> Result<ImportR
             for e in entries.flatten() {
                 let p = e.path();
                 if p.is_file() && p.extension().and_then(|x| x.to_str()) == Some("md") {
-                    import_markdown_file(db, &p, "global", "Global Preferences", None, "antigravity", "note", &mut report, &mut touched_projects)?;
+                    import_markdown_file(&mut ctx, &p, "global", "Global Preferences", None, "antigravity", "note")?;
                 } else if p.is_dir() {
                     if let Ok(sub) = std::fs::read_dir(&p) {
                         for sf in sub.flatten() {
                             let sp = sf.path();
                             if sp.is_file() && sp.extension().and_then(|x| x.to_str()) == Some("md") {
-                                import_markdown_file(db, &sp, "global", "Global Preferences", None, "antigravity", "note", &mut report, &mut touched_projects)?;
+                                import_markdown_file(&mut ctx, &sp, "global", "Global Preferences", None, "antigravity", "note")?;
                             }
                         }
                     }
@@ -113,15 +173,13 @@ pub fn import_all(db: &Database, projects_root: Option<&Path>) -> Result<ImportR
                                 .unwrap_or(false);
                             let default_kind = if is_index { "note" } else { "arch" };
                             import_markdown_file(
-                                db,
+                                &mut ctx,
                                 &fpath,
                                 &pid,
                                 &pname,
                                 remote.as_deref(),
                                 "claude",
                                 default_kind,
-                                &mut report,
-                                &mut touched_projects,
                             )?;
                         }
                     }
@@ -130,60 +188,56 @@ pub fn import_all(db: &Database, projects_root: Option<&Path>) -> Result<ImportR
         }
     }
 
-    // 3. Scan a projects root directory (depth 1) for CLAUDE.md, AGENTS.md, GEMINI.md, .cursorrules, README.md, docs/ARCHITECTURE.md
-    if let Some(root) = effective_root {
-        if root.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(root) {
-                for entry in entries.flatten() {
-                    let pdir = entry.path();
-                    if !pdir.is_dir() {
-                        continue;
+    // 3. Scan project roots (depth 1) for CLAUDE.md, AGENTS.md, GEMINI.md, .cursorrules, docs/ARCHITECTURE.md
+    for root in scan_roots {
+        if !root.is_dir() {
+            continue;
+        }
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            for entry in entries.flatten() {
+                let pdir = entry.path();
+                if !pdir.is_dir() {
+                    continue;
+                }
+                let detected = detect_project(Some(&pdir));
+                for (fname, agent) in [
+                    ("CLAUDE.md", "claude"),
+                    ("AGENTS.md", "antigravity"),
+                    ("GEMINI.md", "antigravity"),
+                    ("MEMORY.md", "claude"),
+                    (".cursorrules", "cursor"),
+                    (".github/copilot-instructions.md", "copilot"),
+                    ("docs/ARCHITECTURE.md", "project"),
+                ] {
+                    let candidate = pdir.join(fname);
+                    if candidate.is_file() {
+                        import_markdown_file(
+                            &mut ctx,
+                            &candidate,
+                            &detected.id,
+                            &detected.name,
+                            detected.git_remote.as_deref(),
+                            agent,
+                            "arch",
+                        )?;
                     }
-                    let detected = detect_project(Some(&pdir));
-                    for (fname, agent) in [
-                        ("CLAUDE.md", "claude"),
-                        ("AGENTS.md", "antigravity"),
-                        ("GEMINI.md", "antigravity"),
-                        ("MEMORY.md", "claude"),
-                        (".cursorrules", "cursor"),
-                        (".github/copilot-instructions.md", "copilot"),
-                        ("docs/ARCHITECTURE.md", "project"),
-                        ("README.md", "project"),
-                    ] {
-                        let candidate = pdir.join(fname);
-                        if candidate.is_file() {
-                            import_markdown_file(
-                                db,
-                                &candidate,
-                                &detected.id,
-                                &detected.name,
-                                detected.git_remote.as_deref(),
-                                agent,
-                                "arch",
-                                &mut report,
-                                &mut touched_projects,
-                            )?;
-                        }
-                    }
-                    let cursor_dir = pdir.join(".cursor").join("rules");
-                    if cursor_dir.is_dir() {
-                        if let Ok(cfiles) = std::fs::read_dir(&cursor_dir) {
-                            for cf in cfiles.flatten() {
-                                let cp = cf.path();
-                                let ext = cp.extension().and_then(|e| e.to_str()).unwrap_or("");
-                                if ext == "md" || ext == "mdc" {
-                                    import_markdown_file(
-                                        db,
-                                        &cp,
-                                        &detected.id,
-                                        &detected.name,
-                                        detected.git_remote.as_deref(),
-                                        "cursor",
-                                        "arch",
-                                        &mut report,
-                                        &mut touched_projects,
-                                    )?;
-                                }
+                }
+                let cursor_dir = pdir.join(".cursor").join("rules");
+                if cursor_dir.is_dir() {
+                    if let Ok(cfiles) = std::fs::read_dir(&cursor_dir) {
+                        for cf in cfiles.flatten() {
+                            let cp = cf.path();
+                            let ext = cp.extension().and_then(|e| e.to_str()).unwrap_or("");
+                            if ext == "md" || ext == "mdc" {
+                                import_markdown_file(
+                                    &mut ctx,
+                                    &cp,
+                                    &detected.id,
+                                    &detected.name,
+                                    detected.git_remote.as_deref(),
+                                    "cursor",
+                                    "arch",
+                                )?;
                             }
                         }
                     }
@@ -192,8 +246,8 @@ pub fn import_all(db: &Database, projects_root: Option<&Path>) -> Result<ImportR
         }
     }
 
-    report.projects_touched = touched_projects.len();
-    Ok(report)
+    ctx.report.projects_touched = ctx.touched_projects.len();
+    Ok(ctx.report)
 }
 
 fn resolve_claude_project_folder(encoded: &str) -> Option<(String, String, Option<String>)> {
@@ -227,26 +281,26 @@ fn decode_windows_claude_path(encoded: &str) -> Option<PathBuf> {
         }
         let mut matched: Option<(PathBuf, usize)> = None;
         if let Ok(entries) = std::fs::read_dir(&cur) {
-            let mut candidates: Vec<(String, PathBuf)> = entries
+            let mut candidates: Vec<(usize, String, PathBuf)> = entries
                 .flatten()
                 .filter(|e| e.path().is_dir())
                 .filter_map(|e| {
                     let name = e.file_name().to_str()?.to_string();
-                    Some((name, e.path()))
+                    let name_norm: String = name
+                        .chars()
+                        .map(|c| if c == '_' || c == ' ' { '-' } else { c.to_ascii_lowercase() })
+                        .collect();
+                    let char_count = name_norm.chars().count();
+                    Some((char_count, name_norm, e.path()))
                 })
                 .collect();
-            candidates.sort_by(|a, b| b.0.chars().count().cmp(&a.0.chars().count()));
+            candidates.sort_by(|a, b| b.0.cmp(&a.0));
             let rest_norm: String = rest
                 .chars()
                 .map(|c| if c == '_' || c == ' ' { '-' } else { c.to_ascii_lowercase() })
                 .collect();
 
-            for (name, path) in candidates {
-                let name_norm: String = name
-                    .chars()
-                    .map(|c| if c == '_' || c == ' ' { '-' } else { c.to_ascii_lowercase() })
-                    .collect();
-                let char_count = name_norm.chars().count();
+            for (char_count, name_norm, path) in candidates {
                 if rest_norm == name_norm {
                     matched = Some((path, rest.chars().count()));
                     break;
@@ -273,18 +327,16 @@ fn decode_windows_claude_path(encoded: &str) -> Option<PathBuf> {
 }
 
 fn import_markdown_file(
-    db: &Database,
+    ctx: &mut ImportCtx<'_>,
     path: &Path,
     project_id: &str,
     project_name: &str,
     git_remote: Option<&str>,
     source_agent: &str,
     default_kind: &str,
-    report: &mut ImportReport,
-    touched_projects: &mut std::collections::HashSet<String>,
 ) -> Result<(), String> {
     let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    report.files_scanned += 1;
+    ctx.report.files_scanned += 1;
 
     let cleaned = strip_known_blocks(&raw);
     let (fm_title, fm_type, body) = parse_frontmatter(&cleaned);
@@ -293,15 +345,16 @@ fn import_markdown_file(
         return Ok(());
     }
 
-    let body_capped: String = if body_trimmed.chars().count() > 2500 {
-        let mut s: String = body_trimmed.chars().take(2500).collect();
+    let body_capped: String = if body_trimmed.chars().count() > 1500 {
+        let mut s: String = body_trimmed.chars().take(1500).collect();
         s.push_str("\n...(truncated)");
         s
     } else {
         body_trimmed.to_string()
     };
 
-    db.ensure_project(project_id, project_name, git_remote)
+    ctx.db
+        .ensure_project(project_id, project_name, git_remote)
         .map_err(|e| e.to_string())?;
 
     let kind = fm_type
@@ -325,18 +378,16 @@ fn import_markdown_file(
         format!("[{file_label}]\n{body_capped}")
     };
 
-    let existing = db
-        .list_memories(Some(project_id), 10000)
-        .map_err(|e| e.to_string())?;
-    if existing.iter().any(|m| m.content.trim() == content.trim()) {
-        report.memories_skipped_duplicate += 1;
+    if ctx.is_duplicate(project_id, &content)? {
+        ctx.report.memories_skipped_duplicate += 1;
         return Ok(());
     }
 
-    db.add_memory(project_id, &kind, &content, "imported", source_agent)
+    ctx.db
+        .add_memory(project_id, &kind, &content, "imported", source_agent)
         .map_err(|e| e.to_string())?;
-    report.memories_imported += 1;
-    touched_projects.insert(project_id.to_string());
+    ctx.report.memories_imported += 1;
+    ctx.touched_projects.insert(project_id.to_string());
     Ok(())
 }
 
@@ -405,4 +456,22 @@ fn parse_frontmatter(text: &str) -> (Option<String>, Option<String>, &str) {
         }
     }
     (None, None, text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_blocks_parses_frontmatter_and_filters_noise() {
+        let raw = "---\nname: Auth Decision\ntype: project\n---\nBody text here\n<!-- AI-MEMORY-START -->\nignored\n<!-- AI-MEMORY-END -->";
+        let cleaned = strip_known_blocks(raw);
+        let (title, ftype, body) = parse_frontmatter(&cleaned);
+        assert_eq!(title.as_deref(), Some("Auth Decision"));
+        assert_eq!(ftype.as_deref(), Some("project"));
+        assert_eq!(body.trim(), "Body text here");
+
+        assert!(is_noise_content("# Title\n- [link](a.md)\n", Path::new("MEMORY.md")));
+        assert!(!is_noise_content("Actual note content", Path::new("MEMORY.md")));
+    }
 }

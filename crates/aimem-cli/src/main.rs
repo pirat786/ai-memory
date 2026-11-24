@@ -20,6 +20,8 @@ enum Commands {
         project: Option<String>,
         #[arg(long, default_value_t = 30)]
         limit: usize,
+        #[arg(long, default_value_t = 12000)]
+        max_chars: usize,
         #[arg(long)]
         json: bool,
     },
@@ -56,7 +58,17 @@ enum Commands {
         #[arg(long, default_value_t = 30)]
         limit: usize,
     },
-    /// Delete a memory entry by ID
+    /// Edit an existing memory entry (supports ID prefix)
+    Edit {
+        id: String,
+        #[arg(long)]
+        content: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        tags: Option<String>,
+    },
+    /// Delete a memory entry by ID (supports ID prefix)
     Rm { id: String },
     /// Authenticate with Google Drive (drive.appdata)
     Auth {
@@ -77,8 +89,17 @@ enum Commands {
         #[arg(long)]
         projects_dir: Option<std::path::PathBuf>,
     },
+    /// Purge soft-deleted memories older than N days
+    Gc {
+        #[arg(long, default_value_t = 90)]
+        days: i64,
+    },
     /// Show database path and sync status
     Status,
+}
+
+fn short_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
 }
 
 fn main() {
@@ -91,7 +112,12 @@ fn main() {
 
 fn run(cmd: Commands) -> Result<(), String> {
     match cmd {
-        Commands::Context { project, limit, json } => {
+        Commands::Context {
+            project,
+            limit,
+            max_chars,
+            json,
+        } => {
             let db = Database::open_default().map_err(|e| e.to_string())?;
             let detected = detect_project(None);
             let pid = project.unwrap_or_else(|| detected.id.clone());
@@ -116,24 +142,40 @@ fn run(cmd: Commands) -> Result<(), String> {
                 return Ok(());
             }
 
-            println!("# AI Memory Context");
-            println!("Project: **{}** (`{}`)", proj.name, proj.id);
+            let mut buf = String::new();
+            buf.push_str("# AI Memory Context\n");
+            buf.push_str(&format!("Project: **{}** (`{}`)\n", proj.name, proj.id));
             if !proj.summary.is_empty() {
-                println!("Summary: {}", proj.summary);
+                buf.push_str(&format!("Summary: {}\n", proj.summary));
             }
-            println!();
+            buf.push('\n');
+
+            let mut used_chars = buf.len();
+            let mut omitted = 0usize;
 
             if !global_items.is_empty() {
-                println!("## Global Preferences & Rules");
+                buf.push_str("## Global Preferences & Rules\n");
                 for m in &global_items {
-                    println!("- [{}] {} _(id: {}, by {})_", m.kind, m.content, &m.id[..8], m.source_agent);
+                    let line = format!(
+                        "- [{}] {} _(id: {}, by {})_\n",
+                        m.kind,
+                        m.content,
+                        short_id(&m.id),
+                        m.source_agent
+                    );
+                    if max_chars > 0 && used_chars + line.len() > max_chars {
+                        omitted += 1;
+                        continue;
+                    }
+                    used_chars += line.len();
+                    buf.push_str(&line);
                 }
-                println!();
+                buf.push('\n');
             }
 
-            println!("## Project Memory");
+            buf.push_str("## Project Memory\n");
             if project_items.is_empty() {
-                println!("_(no project memories yet)_");
+                buf.push_str("_(no project memories yet)_\n");
             } else {
                 for m in &project_items {
                     let tags = if m.tags.is_empty() {
@@ -141,12 +183,28 @@ fn run(cmd: Commands) -> Result<(), String> {
                     } else {
                         format!(" [tags: {}]", m.tags)
                     };
-                    println!(
-                        "- [{}] {}{} _(id: {}, by {})_",
-                        m.kind, m.content, tags, &m.id[..8], m.source_agent
+                    let line = format!(
+                        "- [{}] {}{} _(id: {}, by {})_\n",
+                        m.kind,
+                        m.content,
+                        tags,
+                        short_id(&m.id),
+                        m.source_agent
                     );
+                    if max_chars > 0 && used_chars + line.len() > max_chars {
+                        omitted += 1;
+                        continue;
+                    }
+                    used_chars += line.len();
+                    buf.push_str(&line);
                 }
             }
+            if omitted > 0 {
+                buf.push_str(&format!(
+                    "\n_({omitted} more entries omitted due to --max-chars={max_chars}; use `aimem search \"<query>\"` for details)_\n"
+                ));
+            }
+            print!("{buf}");
         }
         Commands::Add {
             content,
@@ -197,7 +255,7 @@ fn run(cmd: Commands) -> Result<(), String> {
                 return Ok(());
             }
             for m in items {
-                println!("[{}] ({}) {} — {}", m.kind, m.project_id, &m.id[..8], m.content);
+                println!("[{}] ({}) {} — {}", m.kind, m.project_id, short_id(&m.id), m.content);
             }
         }
         Commands::List {
@@ -207,8 +265,7 @@ fn run(cmd: Commands) -> Result<(), String> {
         } => {
             let db = Database::open_default().map_err(|e| e.to_string())?;
             if projects {
-                for p in db.list_projects().map_err(|e| e.to_string())? {
-                    let count = db.list_memories(Some(&p.id), 10000).map_err(|e| e.to_string())?.len();
+                for (p, count) in db.list_projects_with_counts().map_err(|e| e.to_string())? {
                     println!("{} — {} ({count} memories)", p.id, p.name);
                 }
                 return Ok(());
@@ -219,12 +276,29 @@ fn run(cmd: Commands) -> Result<(), String> {
                 println!("[{}] {} — {}", m.kind, m.id, m.content);
             }
         }
+        Commands::Edit {
+            id,
+            content,
+            kind,
+            tags,
+        } => {
+            if content.is_none() && kind.is_none() && tags.is_none() {
+                return Err("Provide at least one of --content, --kind, or --tags.".to_string());
+            }
+            let db = Database::open_default().map_err(|e| e.to_string())?;
+            match db
+                .update_memory_by_prefix(&id, kind.as_deref(), content.as_deref(), tags.as_deref())
+                .map_err(|e| e.to_string())?
+            {
+                Some(m) => println!("Updated [{}] {} — {}", m.kind, short_id(&m.id), m.content),
+                None => println!("Not found: {id}"),
+            }
+        }
         Commands::Rm { id } => {
             let db = Database::open_default().map_err(|e| e.to_string())?;
-            if db.soft_delete_memory(&id).map_err(|e| e.to_string())? {
-                println!("Deleted {id}");
-            } else {
-                println!("Not found: {id}");
+            match db.soft_delete_memory_by_prefix(&id).map_err(|e| e.to_string())? {
+                Some(full_id) => println!("Deleted {full_id}"),
+                None => println!("Not found: {id}"),
             }
         }
         Commands::Auth {
@@ -280,16 +354,21 @@ fn run(cmd: Commands) -> Result<(), String> {
                 report.projects_touched
             );
         }
+        Commands::Gc { days } => {
+            let db = Database::open_default().map_err(|e| e.to_string())?;
+            let removed = db.gc_deleted(days).map_err(|e| e.to_string())?;
+            println!("Purged {removed} deleted memories older than {days} days.");
+        }
         Commands::Status => {
             let db = Database::open_default().map_err(|e| e.to_string())?;
             let cfg = load_config();
             let detected = detect_project(None);
             let projects = db.list_projects().map_err(|e| e.to_string())?;
-            let memories = db.list_memories(None, 10000).map_err(|e| e.to_string())?;
+            let active_memories = db.count_memories().map_err(|e| e.to_string())?;
             println!("Data dir:         {}", data_dir().display());
             println!("Current project:  {} ({})", detected.name, detected.id);
             println!("Projects:         {}", projects.len());
-            println!("Active memories:  {}", memories.len());
+            println!("Active memories:  {}", active_memories);
             println!("Google connected: {}", cfg.google_refresh_token.is_some());
             println!(
                 "Last sync:        {}",

@@ -24,6 +24,7 @@ struct ProjectWithCount {
 
 #[derive(Serialize)]
 struct StatusDto {
+    version: String,
     data_dir: String,
     projects_count: usize,
     memories_count: usize,
@@ -31,6 +32,8 @@ struct StatusDto {
     google_connected: bool,
     last_sync_at: Option<String>,
     device_name: String,
+    auto_sync: bool,
+    scan_dirs: Vec<String>,
 }
 
 #[tauri::command]
@@ -38,29 +41,28 @@ fn get_status() -> Result<StatusDto, String> {
     let db = Database::open_default().map_err(|e| e.to_string())?;
     let cfg = load_config();
     let projects = db.list_projects().map_err(|e| e.to_string())?;
-    let memories = db.list_memories(None, 10000).map_err(|e| e.to_string())?;
+    let memories_count = db.count_memories().map_err(|e| e.to_string())?;
     let client_id = resolve_client_creds(&cfg).ok().map(|(id, _)| id);
     Ok(StatusDto {
+        version: env!("CARGO_PKG_VERSION").to_string(),
         data_dir: data_dir().display().to_string(),
         projects_count: projects.len(),
-        memories_count: memories.len(),
+        memories_count,
         google_client_id: client_id,
         google_connected: cfg.google_refresh_token.is_some(),
         last_sync_at: cfg.last_sync_at,
         device_name: cfg.device_name.unwrap_or_else(default_device_name),
+        auto_sync: cfg.auto_sync,
+        scan_dirs: cfg.scan_dirs,
     })
 }
 
 #[tauri::command]
 fn list_projects() -> Result<Vec<ProjectWithCount>, String> {
     let db = Database::open_default().map_err(|e| e.to_string())?;
-    let projects = db.list_projects().map_err(|e| e.to_string())?;
+    let projects = db.list_projects_with_counts().map_err(|e| e.to_string())?;
     let mut out = Vec::with_capacity(projects.len());
-    for p in projects {
-        let count = db
-            .list_memories(Some(&p.id), 10000)
-            .map_err(|e| e.to_string())?
-            .len();
+    for (p, count) in projects {
         if count == 0 && p.id != "global" {
             continue;
         }
@@ -77,16 +79,34 @@ fn list_projects() -> Result<Vec<ProjectWithCount>, String> {
 }
 
 #[tauri::command]
-fn list_memories(project_id: Option<String>, query: Option<String>) -> Result<Vec<Memory>, String> {
+fn list_memories(
+    project_id: Option<String>,
+    query: Option<String>,
+    kind: Option<String>,
+    agent: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> Result<Vec<Memory>, String> {
     let db = Database::open_default().map_err(|e| e.to_string())?;
     let pid = project_id.filter(|s| !s.is_empty() && s != "all");
     let q = query.filter(|s| !s.trim().is_empty());
+    let lim = limit.unwrap_or(100).clamp(1, 500);
+    let off = offset.unwrap_or(0);
     if let Some(q_str) = q {
-        db.search_memories(&q_str, pid.as_deref(), 200)
+        let mut items = db
+            .search_memories(&q_str, pid.as_deref(), lim + off)
+            .map_err(|e| e.to_string())?;
+        if let Some(k) = kind.as_deref().filter(|s| !s.is_empty() && *s != "all") {
+            items.retain(|m| m.kind == k);
+        }
+        if let Some(a) = agent.as_deref().filter(|s| !s.is_empty() && *s != "all") {
+            items.retain(|m| m.source_agent == a);
+        }
+        Ok(items.into_iter().skip(off).take(lim).collect())
     } else {
-        db.list_memories(pid.as_deref(), 200)
+        db.list_memories_filtered(pid.as_deref(), kind.as_deref(), agent.as_deref(), lim, off)
+            .map_err(|e| e.to_string())
     }
-    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -115,6 +135,18 @@ fn add_memory(
 }
 
 #[tauri::command]
+fn update_memory(
+    id: String,
+    kind: Option<String>,
+    content: Option<String>,
+    tags: Option<String>,
+) -> Result<Option<Memory>, String> {
+    let db = Database::open_default().map_err(|e| e.to_string())?;
+    db.update_memory(&id, kind.as_deref(), content.as_deref(), tags.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn delete_memory(id: String) -> Result<bool, String> {
     let db = Database::open_default().map_err(|e| e.to_string())?;
     db.soft_delete_memory(&id).map_err(|e| e.to_string())
@@ -125,6 +157,8 @@ fn save_settings(
     device_name: Option<String>,
     google_client_id: Option<String>,
     google_client_secret: Option<String>,
+    auto_sync: Option<bool>,
+    scan_dirs: Option<Vec<String>>,
 ) -> Result<(), String> {
     let mut cfg = load_config();
     if let Some(d) = device_name {
@@ -145,6 +179,16 @@ fn save_settings(
         if !sec.trim().is_empty() {
             cfg.google_client_secret = Some(sec.trim().to_string());
         }
+    }
+    if let Some(v) = auto_sync {
+        cfg.auto_sync = v;
+    }
+    if let Some(dirs) = scan_dirs {
+        cfg.scan_dirs = dirs
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
     }
     save_config(&cfg).map_err(|e| e.to_string())
 }
@@ -197,6 +241,8 @@ fn disconnect_google() -> Result<(), String> {
     cfg.google_token_expires_at = None;
     cfg.drive_file_id = None;
     cfg.last_sync_at = None;
+    cfg.last_remote_md5 = None;
+    cfg.last_synced_local_ts = None;
     save_config(&cfg).map_err(|e| e.to_string())
 }
 
@@ -252,6 +298,7 @@ fn main() {
             list_projects,
             list_memories,
             add_memory,
+            update_memory,
             delete_memory,
             save_settings,
             auth_google,
@@ -319,9 +366,7 @@ fn main() {
                 }
                 if !cfg.auto_import_done {
                     if let Ok(db) = Database::open_default() {
-                        let default_dir = std::path::Path::new(r"C:\RABOTA\Cods");
-                        let root = if default_dir.is_dir() { Some(default_dir) } else { None };
-                        if import_all(&db, root).is_ok() {
+                        if import_all(&db, None).is_ok() {
                             cfg.auto_import_done = true;
                             let _ = save_config(&cfg);
                             let _ = handle.emit("memory-synced", ());
@@ -343,7 +388,7 @@ fn main() {
 
                 loop {
                     let mut cfg = load_config();
-                    if cfg.google_refresh_token.is_some() {
+                    if cfg.google_refresh_token.is_some() && cfg.auto_sync {
                         if let Ok(mut db) = Database::open_default() {
                             if sync_with_drive(&mut db, &mut cfg).is_ok() {
                                 let _ = handle.emit("memory-synced", ());
