@@ -80,3 +80,39 @@ fn append_block(existing: &str) -> String {
         format!("{trimmed}\n\n{RULE_BLOCK}\n")
     }
 }
+
+pub fn ensure_aimem_in_path() -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let Some(dir) = exe.parent() else {
+        return false;
+    };
+    #[cfg(target_os = "windows")]
+    {
+        if !dir.join("aimem.exe").is_file() {
+            return false;
+        }
+        let dir_str = dir.to_string_lossy().to_string();
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        if current_path
+            .split(';')
+            .any(|p| p.trim().eq_ignore_ascii_case(&dir_str))
+        {
+            return true;
+        }
+        let script = format!(
+            "$p=[Environment]::GetEnvironmentVariable('Path','User'); if (-not $p) {{ $p='' }}; $parts=$p -split ';'; if ($parts -notcontains '{0}') {{ $next = if ($p.TrimEnd(';')) {{ \"$($p.TrimEnd(';'));{0}\" }} else {{ '{0}' }}; [Environment]::SetEnvironmentVariable('Path', $next, 'User') }}",
+            dir_str.replace('\'', "''")
+        );
+        let status = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
+            .status();
+        return status.map(|s| s.success()).unwrap_or(false);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = dir;
+        true
+    }
+}

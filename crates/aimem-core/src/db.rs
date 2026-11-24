@@ -57,6 +57,7 @@ pub struct MergeStats {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct AppConfig {
     pub google_client_id: Option<String>,
     pub google_client_secret: Option<String>,
@@ -67,6 +68,7 @@ pub struct AppConfig {
     pub last_sync_at: Option<String>,
     pub device_name: Option<String>,
     pub auto_sync: bool,
+    pub auto_import_done: bool,
 }
 
 pub fn data_dir() -> PathBuf {

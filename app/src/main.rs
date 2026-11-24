@@ -2,7 +2,7 @@
 
 use aimem_core::db::{data_dir, load_config, save_config, Database, Memory};
 use aimem_core::importer::{import_all, ImportReport};
-use aimem_core::rules::install_global_rules;
+use aimem_core::rules::{ensure_aimem_in_path, install_global_rules};
 use aimem_core::sync::{
     authenticate_google, default_device_name, resolve_client_creds, sync_with_drive, SyncReport,
 };
@@ -249,17 +249,35 @@ fn main() {
             }
             let _tray = builder.build(app)?;
 
-            // Background auto-sync every 5 minutes when Google Drive is connected
+            // Auto-configure PATH, agent rules, first-run import, and background sync
             let handle = app.handle().clone();
-            std::thread::spawn(move || loop {
-                std::thread::sleep(Duration::from_secs(300));
+            std::thread::spawn(move || {
+                let _ = ensure_aimem_in_path();
+                let _ = install_global_rules();
+
                 let mut cfg = load_config();
-                if cfg.google_refresh_token.is_some() {
-                    if let Ok(mut db) = Database::open_default() {
-                        if sync_with_drive(&mut db, &mut cfg).is_ok() {
+                if !cfg.auto_import_done {
+                    if let Ok(db) = Database::open_default() {
+                        let default_dir = std::path::Path::new(r"C:\RABOTA\Cods");
+                        let root = if default_dir.is_dir() { Some(default_dir) } else { None };
+                        if import_all(&db, root).is_ok() {
+                            cfg.auto_import_done = true;
+                            let _ = save_config(&cfg);
                             let _ = handle.emit("memory-synced", ());
                         }
                     }
+                }
+
+                loop {
+                    let mut cfg = load_config();
+                    if cfg.google_refresh_token.is_some() {
+                        if let Ok(mut db) = Database::open_default() {
+                            if sync_with_drive(&mut db, &mut cfg).is_ok() {
+                                let _ = handle.emit("memory-synced", ());
+                            }
+                        }
+                    }
+                    std::thread::sleep(Duration::from_secs(300));
                 }
             });
 
