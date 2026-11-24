@@ -306,7 +306,6 @@
         <input id="searchInput" type="search" placeholder="Поиск по памяти (FTS5)..." oninput="debouncedLoadMemories()" />
       </div>
       <button onclick="importMemories()">Импорт памяти</button>
-      <button onclick="installRules()">Подключить агентов</button>
       <button class="primary" onclick="document.getElementById('newContent').focus()">+ Новая запись</button>
     </header>
 
@@ -495,16 +494,9 @@
       await loadMemories();
     }
 
-    async function installRules() {
-      const files = await invoke('install_rules');
-      toast('Правила обновлены: ' + files.length + ' файл(а)');
-    }
-
     async function importMemories() {
-      const dir = prompt('Папка с проектами (для сканирования CLAUDE.md / AGENTS.md) или оставь пустым для импорта только из ~/.claude:', 'C:\\RABOTA\\Cods');
-      if (dir === null) return;
       try {
-        const res = await invoke('import_memories', { projectsDir: dir.trim() || null });
+        const res = await invoke('import_memories', { projectsDir: null });
         toast(`Импорт: +${res.memories_imported} записей (${res.projects_touched} проектов, пропущено дублей: ${res.memories_skipped_duplicate})`);
         await loadProjects();
         await loadMemories();
