@@ -199,51 +199,32 @@ fn disconnect_google() -> Result<(), String> {
 
 #[tauri::command]
 fn get_autostart(app: tauri::AppHandle) -> bool {
-    #[cfg(windows)]
-    {
-        use tauri_plugin_autostart::ManagerExt;
-        return app.autolaunch().is_enabled().unwrap_or(false);
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = app;
-        false
-    }
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().unwrap_or(false)
 }
 
 #[tauri::command]
 fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<bool, String> {
-    #[cfg(windows)]
-    {
-        use tauri_plugin_autostart::ManagerExt;
-        let mgr = app.autolaunch();
-        if enabled {
-            mgr.enable().map_err(|e| e.to_string())?;
-        } else {
-            mgr.disable().map_err(|e| e.to_string())?;
-        }
-        return Ok(mgr.is_enabled().unwrap_or(enabled));
+    use tauri_plugin_autostart::ManagerExt;
+    let mgr = app.autolaunch();
+    if enabled {
+        mgr.enable().map_err(|e| e.to_string())?;
+    } else {
+        mgr.disable().map_err(|e| e.to_string())?;
     }
-    #[cfg(not(windows))]
-    {
-        let _ = (app, enabled);
-        Ok(false)
-    }
+    Ok(mgr.is_enabled().unwrap_or(enabled))
 }
 
 #[tauri::command]
 async fn install_update(app: tauri::AppHandle) -> Result<bool, String> {
-    #[cfg(windows)]
-    {
-        use tauri_plugin_updater::UpdaterExt;
-        let updater = app.updater().map_err(|e| e.to_string())?;
-        if let Some(update) = updater.check().await.map_err(|e| e.to_string())? {
-            update
-                .download_and_install(|_, _| {}, || {})
-                .await
-                .map_err(|e| e.to_string())?;
-            app.restart();
-        }
+    use tauri_plugin_updater::UpdaterExt;
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    if let Some(update) = updater.check().await.map_err(|e| e.to_string())? {
+        update
+            .download_and_install(|_, _| {}, || {})
+            .await
+            .map_err(|e| e.to_string())?;
+        app.restart();
     }
     Ok(false)
 }
@@ -257,17 +238,12 @@ fn show_main_window(app: &tauri::AppHandle) {
 }
 
 fn main() {
-    let mut builder = tauri::Builder::default();
-    #[cfg(windows)]
-    {
-        builder = builder
-            .plugin(tauri_plugin_updater::Builder::new().build())
-            .plugin(tauri_plugin_autostart::init(
-                tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-                None,
-            ));
-    }
-    builder
+    tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .invoke_handler(tauri::generate_handler![
             get_status,
             list_projects,
@@ -332,7 +308,6 @@ fn main() {
                 let _ = install_global_rules();
 
                 let mut cfg = load_config();
-                #[cfg(windows)]
                 if !cfg.autostart_configured {
                     use tauri_plugin_autostart::ManagerExt;
                     let _ = handle.autolaunch().enable();
@@ -351,7 +326,6 @@ fn main() {
                     }
                 }
 
-                #[cfg(windows)]
                 {
                     let upd_handle = handle.clone();
                     tauri::async_runtime::spawn(async move {

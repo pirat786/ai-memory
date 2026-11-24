@@ -1,0 +1,200 @@
+name: Release (Windows, macOS, Linux)
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.version.outputs.should_release }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check release version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(jq -r '.version' app/tauri.conf.json)
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid version in app/tauri.conf.json: $version" >&2
+            exit 1
+          fi
+          tag="v$version"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME:-}" != "$tag" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match app/tauri.conf.json ($version)." >&2
+            exit 1
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists, skipping."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Release $tag does not exist yet, will build and publish."
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Verify release keys and configuration
+        if: steps.version.outputs.should_release == 'true'
+        env:
+          TAURI_SIGNING_PUBLIC_KEY: ${{ vars.TAURI_SIGNING_PUBLIC_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          AIMEM_GOOGLE_CLIENT_ID: ${{ vars.AIMEM_GOOGLE_CLIENT_ID }}
+          AIMEM_GOOGLE_CLIENT_SECRET: ${{ secrets.AIMEM_GOOGLE_CLIENT_SECRET }}
+        run: |
+          if [[ -z "${TAURI_SIGNING_PUBLIC_KEY// }" ]]; then
+            echo "Missing TAURI_SIGNING_PUBLIC_KEY repository variable." >&2
+            exit 1
+          fi
+          if [[ -z "${TAURI_SIGNING_PRIVATE_KEY// }" ]]; then
+            echo "Missing TAURI_SIGNING_PRIVATE_KEY repository secret." >&2
+            exit 1
+          fi
+          if [[ -z "${AIMEM_GOOGLE_CLIENT_ID// }" || -z "${AIMEM_GOOGLE_CLIENT_SECRET// }" ]]; then
+            echo "Missing AIMEM_GOOGLE_CLIENT_ID or AIMEM_GOOGLE_CLIENT_SECRET." >&2
+            exit 1
+          fi
+          trimmed_id=$(echo "$AIMEM_GOOGLE_CLIENT_ID" | tr -d '[:space:]')
+          if [[ "$trimmed_id" != *.apps.googleusercontent.com ]]; then
+            echo "AIMEM_GOOGLE_CLIENT_ID must end with .apps.googleusercontent.com." >&2
+            exit 1
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.should_release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform_key: windows-x86_64
+          - os: macos-latest
+            platform_key: darwin-aarch64
+          - os: ubuntu-latest
+            platform_key: linux-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.platform_key }}
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev
+      - name: Test workspace
+        run: cargo test --workspace --locked
+      - name: Build aimem CLI
+        env:
+          AIMEM_GOOGLE_CLIENT_ID: ${{ vars.AIMEM_GOOGLE_CLIENT_ID }}
+          AIMEM_GOOGLE_CLIENT_SECRET: ${{ secrets.AIMEM_GOOGLE_CLIENT_SECRET }}
+        run: cargo build --release --locked -p aimem-cli
+      - name: Install Tauri CLI
+        run: npm install --global --ignore-scripts --no-audit --no-fund @tauri-apps/cli@2
+      - name: Prepare updater configuration
+        shell: bash
+        env:
+          UPDATE_PUBLIC_KEY: ${{ vars.TAURI_SIGNING_PUBLIC_KEY }}
+        run: |
+          cat <<EOF > "$RUNNER_TEMP/tauri-release.json"
+          {
+            "bundle": { "createUpdaterArtifacts": true },
+            "plugins": {
+              "updater": {
+                "pubkey": "$(echo "$UPDATE_PUBLIC_KEY" | tr -d '\r\n')",
+                "endpoints": ["https://github.com/$GITHUB_REPOSITORY/releases/latest/download/latest.json"]
+              }
+            }
+          }
+          EOF
+      - name: Build and sign Tauri bundle
+        working-directory: app
+        env:
+          AIMEM_GOOGLE_CLIENT_ID: ${{ vars.AIMEM_GOOGLE_CLIENT_ID }}
+          AIMEM_GOOGLE_CLIENT_SECRET: ${{ secrets.AIMEM_GOOGLE_CLIENT_SECRET }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: tauri build --ci --config "$RUNNER_TEMP/tauri-release.json" -- --locked
+      - name: Collect platform artifacts
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          TAG="${{ needs.check.outputs.tag }}"
+          VER="${TAG#v}"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            cp target/release/aimem.exe "$RUNNER_TEMP/out/aimem-windows-x64.exe"
+            SETUP=$(ls target/release/bundle/nsis/*-setup.exe | head -n1)
+            cp "$SETUP" "$RUNNER_TEMP/out/AI_Memory_${VER}_x64-setup.exe"
+            cp "${SETUP}.sig" "$RUNNER_TEMP/out/AI_Memory_${VER}_x64-setup.exe.sig"
+            echo "AI_Memory_${VER}_x64-setup.exe" > "$RUNNER_TEMP/out/updater_asset.txt"
+          elif [[ "$RUNNER_OS" == "macOS" ]]; then
+            cp target/release/aimem "$RUNNER_TEMP/out/aimem-macos-arm64"
+            DMG=$(ls target/release/bundle/dmg/*.dmg | head -n1)
+            cp "$DMG" "$RUNNER_TEMP/out/AI_Memory_${VER}_aarch64.dmg"
+            TAR=$(ls target/release/bundle/macos/*.app.tar.gz | head -n1)
+            cp "$TAR" "$RUNNER_TEMP/out/AI_Memory_${VER}_aarch64.app.tar.gz"
+            cp "${TAR}.sig" "$RUNNER_TEMP/out/AI_Memory_${VER}_aarch64.app.tar.gz.sig"
+            echo "AI_Memory_${VER}_aarch64.app.tar.gz" > "$RUNNER_TEMP/out/updater_asset.txt"
+          else
+            cp target/release/aimem "$RUNNER_TEMP/out/aimem-linux-x64"
+            DEB=$(ls target/release/bundle/deb/*.deb | head -n1)
+            cp "$DEB" "$RUNNER_TEMP/out/AI_Memory_${VER}_amd64.deb"
+            APPIMG=$(ls target/release/bundle/appimage/*.AppImage | head -n1)
+            cp "$APPIMG" "$RUNNER_TEMP/out/AI_Memory_${VER}_amd64.AppImage"
+            cp "${APPIMG}.sig" "$RUNNER_TEMP/out/AI_Memory_${VER}_amd64.AppImage.sig"
+            echo "AI_Memory_${VER}_amd64.AppImage" > "$RUNNER_TEMP/out/updater_asset.txt"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.platform_key }}
+          path: ${{ runner.temp }}/out/*
+
+  publish:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Create latest.json and GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          VER="${TAG#v}"
+          PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          mkdir -p release_files
+          PLATFORMS_JSON="{}"
+
+          for pkey in windows-x86_64 darwin-aarch64 linux-x86_64; do
+            dir="artifacts/dist-${pkey}"
+            if [[ -f "$dir/updater_asset.txt" ]]; then
+              asset=$(cat "$dir/updater_asset.txt")
+              sig=$(cat "$dir/${asset}.sig" | tr -d '\r\n')
+              url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${asset}"
+              PLATFORMS_JSON=$(echo "$PLATFORMS_JSON" | jq --arg k "$pkey" --arg s "$sig" --arg u "$url" '. + {($k): {signature: $s, url: $u}}')
+            fi
+            for f in "$dir"/*; do
+              [[ "$(basename "$f")" == "updater_asset.txt" ]] && continue
+              cp "$f" release_files/
+            done
+          done
+
+          jq -n --arg v "$VER" --arg d "$PUB_DATE" --argjson p "$PLATFORMS_JSON" \
+            '{version: $v, pub_date: $d, platforms: $p}' > release_files/latest.json
+
+          gh release create "$TAG" release_files/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --generate-notes --title "AI Memory $TAG"
