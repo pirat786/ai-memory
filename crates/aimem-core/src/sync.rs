@@ -64,12 +64,16 @@ pub fn resolve_client_creds(cfg: &AppConfig) -> Result<(String, Option<String>)>
         .filter(|s| !s.trim().is_empty())
         .or_else(|| cfg.google_client_id.clone())
         .filter(|s| !s.trim().is_empty())
+        .or_else(|| option_env!("AIMEM_GOOGLE_CLIENT_ID").map(str::to_string))
+        .filter(|s| !s.trim().is_empty())
         .ok_or(SyncError::MissingClientId)?;
 
     let client_secret = std::env::var("AIMEM_GOOGLE_CLIENT_SECRET")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .or_else(|| cfg.google_client_secret.clone())
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| option_env!("AIMEM_GOOGLE_CLIENT_SECRET").map(str::to_string))
         .filter(|s| !s.trim().is_empty());
 
     Ok((client_id, client_secret))

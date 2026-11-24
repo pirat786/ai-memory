@@ -2,7 +2,9 @@
 
 use aimem_core::db::{data_dir, load_config, save_config, Database, Memory};
 use aimem_core::rules::install_global_rules;
-use aimem_core::sync::{authenticate_google, default_device_name, sync_with_drive, SyncReport};
+use aimem_core::sync::{
+    authenticate_google, default_device_name, resolve_client_creds, sync_with_drive, SyncReport,
+};
 use serde::Serialize;
 use std::time::Duration;
 use tauri::menu::{Menu, MenuItem};
@@ -36,11 +38,12 @@ fn get_status() -> Result<StatusDto, String> {
     let cfg = load_config();
     let projects = db.list_projects().map_err(|e| e.to_string())?;
     let memories = db.list_memories(None, 10000).map_err(|e| e.to_string())?;
+    let client_id = resolve_client_creds(&cfg).ok().map(|(id, _)| id);
     Ok(StatusDto {
         data_dir: data_dir().display().to_string(),
         projects_count: projects.len(),
         memories_count: memories.len(),
-        google_client_id: cfg.google_client_id,
+        google_client_id: client_id,
         google_connected: cfg.google_refresh_token.is_some(),
         last_sync_at: cfg.last_sync_at,
         device_name: cfg.device_name.unwrap_or_else(default_device_name),
