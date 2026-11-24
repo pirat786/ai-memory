@@ -122,6 +122,7 @@ jobs:
           }
           EOF
       - name: Build and sign Tauri bundle
+        shell: bash
         working-directory: app
         env:
           AIMEM_GOOGLE_CLIENT_ID: ${{ vars.AIMEM_GOOGLE_CLIENT_ID }}
