@@ -59,7 +59,7 @@ pub fn import_all(db: &Database, projects_root: Option<&Path>) -> Result<ImportR
         }
     }
 
-    // Antigravity knowledge & brain walkthroughs
+    // Antigravity knowledge items
     let agy_knowledge = home.join(".gemini").join("antigravity").join("knowledge");
     if agy_knowledge.is_dir() {
         if let Ok(entries) = std::fs::read_dir(&agy_knowledge) {
@@ -76,22 +76,6 @@ pub fn import_all(db: &Database, projects_root: Option<&Path>) -> Result<ImportR
                             }
                         }
                     }
-                }
-            }
-        }
-    }
-
-    let agy_brain = home.join(".gemini").join("antigravity").join("brain");
-    if agy_brain.is_dir() {
-        if let Ok(convs) = std::fs::read_dir(&agy_brain) {
-            for c in convs.flatten() {
-                let cdir = c.path();
-                if !cdir.is_dir() {
-                    continue;
-                }
-                let wt = cdir.join("walkthrough.md");
-                if wt.is_file() {
-                    import_markdown_file(db, &wt, "global", "Global Preferences", None, "antigravity", "note", &mut report, &mut touched_projects)?;
                 }
             }
         }
@@ -301,12 +285,20 @@ fn import_markdown_file(
     let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     report.files_scanned += 1;
 
-    let cleaned = strip_our_block(&raw);
+    let cleaned = strip_known_blocks(&raw);
     let (fm_title, fm_type, body) = parse_frontmatter(&cleaned);
     let body_trimmed = body.trim();
-    if body_trimmed.is_empty() {
+    if is_noise_content(body_trimmed, path) {
         return Ok(());
     }
+
+    let body_capped: String = if body_trimmed.chars().count() > 2500 {
+        let mut s: String = body_trimmed.chars().take(2500).collect();
+        s.push_str("\n...(truncated)");
+        s
+    } else {
+        body_trimmed.to_string()
+    };
 
     db.ensure_project(project_id, project_name, git_remote)
         .map_err(|e| e.to_string())?;
@@ -327,9 +319,9 @@ fn import_markdown_file(
         .unwrap_or("memory.md");
 
     let content = if let Some(title) = fm_title {
-        format!("[{title}] ({file_label})\n{body_trimmed}")
+        format!("[{title}] ({file_label})\n{body_capped}")
     } else {
-        format!("[{file_label}]\n{body_trimmed}")
+        format!("[{file_label}]\n{body_capped}")
     };
 
     let existing = db
@@ -347,14 +339,46 @@ fn import_markdown_file(
     Ok(())
 }
 
-fn strip_our_block(text: &str) -> String {
-    if let (Some(start), Some(end)) = (text.find(OUR_START), text.find(OUR_END)) {
+fn strip_known_blocks(text: &str) -> String {
+    let mut out = strip_delimited(text, OUR_START, OUR_END);
+    out = strip_delimited(&out, "<!-- rtk-instructions", "<!-- /rtk-instructions -->");
+    out
+}
+
+fn strip_delimited(text: &str, start_marker: &str, end_marker: &str) -> String {
+    if let (Some(start), Some(end)) = (text.find(start_marker), text.find(end_marker)) {
         if end >= start {
-            let end_idx = end + OUR_END.len();
+            let end_idx = end + end_marker.len();
             return format!("{}{}", &text[..start], &text[end_idx..]);
         }
     }
     text.to_string()
+}
+
+fn is_noise_content(body: &str, path: &Path) -> bool {
+    if body.len() < 15 {
+        return true;
+    }
+    if body == "This file controls default behavior for Codex CLI across all projects." {
+        return true;
+    }
+    // Skip Claude MEMORY.md files that are purely a link index to other .md files
+    let is_memory_index = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.eq_ignore_ascii_case("MEMORY.md"))
+        .unwrap_or(false);
+    if is_memory_index {
+        let non_index_lines = body
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("- ["))
+            .count();
+        if non_index_lines == 0 {
+            return true;
+        }
+    }
+    false
 }
 
 fn parse_frontmatter(text: &str) -> (Option<String>, Option<String>, &str) {
