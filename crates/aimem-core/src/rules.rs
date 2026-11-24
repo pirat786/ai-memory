@@ -9,9 +9,9 @@ const RULE_BLOCK: &str = r#"<!-- AI-MEMORY-START -->
 You have access to a shared cross-agent memory CLI (`aimem`) synced across the user's machines.
 - **At the start of a task** in any project, run `aimem context` to load global user preferences and project-specific memory.
 - **When searching past decisions or bugs**, run `aimem search "<query>"`.
-- **When you learn important architectural decisions, non-obvious bug fixes, or user preferences**, save them concisely:
-  - Project-specific: `aimem add "<fact>" --kind decision --agent <antigravity|claude|cursor>`
-  - Global preference: `aimem add "<fact>" --global --kind pref --agent <antigravity|claude|cursor>`
+- **When saving new memory**, keep it concise (1–2 sentences, verified facts only — never save temporary steps, log dumps, or obvious boilerplate):
+  - Project-specific: `aimem add "<fact>" --kind decision --agent <antigravity|claude|codex|cursor>`
+  - Global preference: `aimem add "<fact>" --global --kind pref --agent <antigravity|claude|codex|cursor>`
   - Valid `--kind` values: `decision`, `arch`, `bug`, `pref`, `note`.
 <!-- AI-MEMORY-END -->"#;
 
