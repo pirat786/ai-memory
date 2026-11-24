@@ -29,7 +29,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEFERjFCNkExODNBMDgyMDEKUldRQmdxQ0RvYmJ4cmF0dFVpSXEwNG1KaGJyZ2xtSmcvbEY1c1M5WVpaTzFzUDF6bmVHeVpLWmgK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDBCQUNEOEZEQ0I2OTEwNUQKUldSZEVHbkwvZGlzQ3hEK1VGenFXOGp3NEFveUM4RWh2WTBDK1E3MDlHUTVub25POUM3K1UvMlQK",
       "endpoints": [
         "https://github.com/pirat786/ai-memory/releases/latest/download/latest.json"
       ]

@@ -49,6 +49,7 @@ jobs:
         env:
           TAURI_SIGNING_PUBLIC_KEY: ${{ vars.TAURI_SIGNING_PUBLIC_KEY }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           AIMEM_GOOGLE_CLIENT_ID: ${{ vars.AIMEM_GOOGLE_CLIENT_ID }}
           AIMEM_GOOGLE_CLIENT_SECRET: ${{ secrets.AIMEM_GOOGLE_CLIENT_SECRET }}
         run: |
@@ -69,6 +70,9 @@ jobs:
             echo "AIMEM_GOOGLE_CLIENT_ID must end with .apps.googleusercontent.com." >&2
             exit 1
           fi
+          echo "test" > /tmp/sigtest.txt
+          npx --yes @tauri-apps/cli@2 signer sign /tmp/sigtest.txt
+          rm -f /tmp/sigtest.txt /tmp/sigtest.txt.sig
 
   build:
     needs: check
