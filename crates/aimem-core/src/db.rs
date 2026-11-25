@@ -1,11 +1,11 @@
 use chrono::{Duration as ChronoDuration, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use crate::inbox::InboxEntry;
+use rusqlite::{params, Connection, ErrorCode, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
-use uuid::Uuid;
 
 #[derive(Error, Debug)]
 pub enum DbError {
@@ -17,6 +17,19 @@ pub enum DbError {
     Json(#[from] serde_json::Error),
     #[error("{0}")]
     InvalidInput(String),
+}
+
+impl DbError {
+    pub fn is_access_failure(&self) -> bool {
+        match self {
+            Self::Io(err) => err.kind() == std::io::ErrorKind::PermissionDenied,
+            Self::Sql(rusqlite::Error::SqliteFailure(err, _)) => matches!(
+                err.code,
+                ErrorCode::CannotOpen | ErrorCode::ReadOnly | ErrorCode::PermissionDenied
+            ),
+            _ => false,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, DbError>;
@@ -168,20 +181,35 @@ impl Database {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        let db = Self { conn };
+        let mut db = Self { conn };
         db.migrate()?;
         Ok(db)
     }
 
-    fn migrate(&self) -> Result<()> {
-        let version: i64 = self
-            .conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version >= 1 {
+    fn migrate(&mut self) -> Result<()> {
+        let version = |conn: &Connection| {
+            conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+        };
+        if version(&self.conn)? >= 2 {
             return Ok(());
         }
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = version(&tx)?;
+        if current < 1 {
+            Self::create_initial_schema(&tx)?;
+        }
+        if current < 2 {
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS inbox_receipts (id TEXT PRIMARY KEY);",
+            )?;
+            tx.pragma_update(None, "user_version", 2)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
 
-        self.conn.execute_batch(
+    fn create_initial_schema(tx: &Transaction<'_>) -> Result<()> {
+        tx.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS projects (
                 id TEXT PRIMARY KEY,
@@ -236,12 +264,11 @@ impl Database {
 
         // Ensure built-in global project exists
         let now = Utc::now().to_rfc3339();
-        self.conn.execute(
+        tx.execute(
             "INSERT OR IGNORE INTO projects (id, name, git_remote, summary, created_at, updated_at)
              VALUES ('global', 'Global Preferences', NULL, 'Shared user preferences, style, and cross-project rules.', ?1, ?1)",
             params![now],
         )?;
-        self.conn.pragma_update(None, "user_version", 1)?;
         Ok(())
     }
 
@@ -405,19 +432,64 @@ impl Database {
         tags: &str,
         source_agent: &str,
     ) -> Result<Memory> {
-        let id = Uuid::new_v4().to_string();
+        self.add_entry(&InboxEntry::new(
+            project_id.to_owned(), kind.to_owned(), content.to_owned(), tags.to_owned(),
+            source_agent.to_owned(),
+        ))
+    }
+
+    pub fn add_entry(&self, entry: &InboxEntry) -> Result<Memory> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        Self::insert_entry(&tx, entry)?;
+        let memory = tx.query_row(
+            "SELECT id, project_id, kind, content, tags, source_agent, created_at, updated_at, deleted_at
+             FROM memories WHERE id = ?1",
+            [&entry.id],
+            row_to_memory,
+        )?;
+        tx.commit()?;
+        Ok(memory)
+    }
+
+    pub(crate) fn import_inbox_entry(&mut self, entry: &InboxEntry) -> Result<bool> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let accepted = tx.execute(
+            "INSERT INTO inbox_receipts (id) VALUES (?1) ON CONFLICT(id) DO NOTHING",
+            [&entry.id],
+        )?;
+        if accepted == 0 {
+            return Ok(false);
+        }
+
+        let name = entry.project_id.rsplit('/').next().unwrap_or(&entry.project_id);
         let now = Utc::now().to_rfc3339();
-        let norm_kind = normalize_kind(kind);
-        self.conn.execute(
+        tx.execute(
+            "INSERT INTO projects (id, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(id) DO NOTHING",
+            params![entry.project_id, name, now],
+        )?;
+        let inserted = Self::insert_entry(&tx, entry)?;
+        tx.commit()?;
+        Ok(inserted)
+    }
+
+    fn insert_entry(tx: &Transaction<'_>, entry: &InboxEntry) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let inserted = tx.execute(
             "INSERT INTO memories (id, project_id, kind, content, tags, source_agent, created_at, updated_at, deleted_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, NULL)",
-            params![id, project_id, norm_kind, content.trim(), tags.trim(), source_agent.trim(), now],
-        )?;
-        self.conn.execute(
-            "UPDATE projects SET updated_at = ?1 WHERE id = ?2",
-            params![now, project_id],
-        )?;
-        Ok(self.get_memory(&id)?.expect("inserted memory"))
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, NULL) ON CONFLICT(id) DO NOTHING",
+            params![
+                entry.id, entry.project_id, normalize_kind(&entry.kind), entry.content.trim(),
+                entry.tags.trim(), entry.source_agent.trim(), now
+            ],
+        )? > 0;
+        if inserted {
+            tx.execute(
+                "UPDATE projects SET updated_at = ?1 WHERE id = ?2",
+                params![now, entry.project_id],
+            )?;
+        }
+        Ok(inserted)
     }
 
     pub fn get_memory(&self, id: &str) -> Result<Option<Memory>> {
@@ -804,6 +876,7 @@ fn build_fts_query(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
 
     #[test]
     fn crud_search_and_merge() {

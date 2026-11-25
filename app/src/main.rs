@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod inbox;
+
 use aimem_core::db::{data_dir, load_config, save_config, Database, Memory};
 use aimem_core::importer::{import_all, ImportReport};
 use aimem_core::rules::{ensure_aimem_in_path, install_global_rules};
@@ -301,6 +303,9 @@ fn main() {
             update_memory,
             delete_memory,
             save_settings,
+            inbox::get_inbox_settings,
+            inbox::save_inbox_settings,
+            inbox::import_inbox_now,
             auth_google,
             sync_now,
             install_rules,
@@ -350,6 +355,8 @@ fn main() {
                 builder = builder.icon(icon.clone());
             }
             let _tray = builder.build(app)?;
+
+            inbox::start(app.handle().clone());
 
             // Auto-configure PATH, agent rules, first-run import, and background sync + updater
             let handle = app.handle().clone();

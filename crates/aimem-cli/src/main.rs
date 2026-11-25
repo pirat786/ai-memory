@@ -1,3 +1,5 @@
+mod add;
+
 use aimem_core::db::{data_dir, load_config, save_config, Database};
 use aimem_core::importer::import_all;
 use aimem_core::project::detect_project;
@@ -26,19 +28,7 @@ enum Commands {
         json: bool,
     },
     /// Add a new memory entry
-    Add {
-        content: String,
-        #[arg(long, default_value = "note")]
-        kind: String,
-        #[arg(long, default_value = "")]
-        tags: String,
-        #[arg(long, default_value = "user")]
-        agent: String,
-        #[arg(long)]
-        global: bool,
-        #[arg(long)]
-        project: Option<String>,
-    },
+    Add(add::AddArgs),
     /// Full-text search across memories (FTS5)
     Search {
         query: String,
@@ -206,31 +196,7 @@ fn run(cmd: Commands) -> Result<(), String> {
             }
             print!("{buf}");
         }
-        Commands::Add {
-            content,
-            kind,
-            tags,
-            agent,
-            global,
-            project,
-        } => {
-            let db = Database::open_default().map_err(|e| e.to_string())?;
-            let pid = if global {
-                "global".to_string()
-            } else if let Some(p) = project {
-                db.ensure_project(&p, &p, None).map_err(|e| e.to_string())?;
-                p
-            } else {
-                let detected = detect_project(None);
-                db.ensure_project(&detected.id, &detected.name, detected.git_remote.as_deref())
-                    .map_err(|e| e.to_string())?;
-                detected.id
-            };
-            let mem = db
-                .add_memory(&pid, &kind, &content, &tags, &agent)
-                .map_err(|e| e.to_string())?;
-            println!("Saved [{}] {} -> {} ({})", mem.kind, mem.id, mem.project_id, mem.content);
-        }
+        Commands::Add(args) => add::run(args).map_err(|err| err.to_string())?,
         Commands::Search {
             query,
             project_only,

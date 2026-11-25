@@ -43,9 +43,23 @@ Built binaries:
    aimem search "FTS5"
    ```
 
+
+## Agent inbox for restricted workspaces
+
+1. Create an inbox folder that the agents can write to. Use a dedicated folder rather than your SQLite or Google credentials directory.
+2. In the desktop app, open **Settings → Agent memory inbox**, enter the absolute folder path and list the project IDs you want to accept. Run `aimem status` from the project root with regular access to see the ID, for example `local/my-project`.
+3. Every agent can keep using `aimem add` with its own `--agent` value. When SQLite cannot be opened or written because of access restrictions, the CLI writes a project-scoped request to the inbox and prints `Queued`. If the desktop settings are unavailable to an agent, pass `--inbox <directory>` or set `AIMEM_INBOX_DIR` for that agent.
+
+```powershell
+aimem add "Validate build inputs" --kind decision --agent cursor
+aimem add "Document the resulting file format" --kind arch --agent claude --queue --inbox "C:\Projects\aimem-inbox"
+```
+
+The desktop app imports approved projects every five seconds while running, including in the tray. Use **Import saved inbox now** to see how many requests were imported, skipped, or invalid. Requests remain on disk while the app is closed. Import is idempotent. The inbox accepts project memories only. Global preferences still require direct database access. `aimem context` and `aimem search` still read from SQLite.
+
 ## Automated Releases (GitHub Actions)
 
-The workflow in [.github/workflows/windows-release.yml](.github/workflows/windows-release.yml) builds, signs, and publishes the NSIS installer, `aimem.exe`, and `latest.json` updater manifest whenever `app/tauri.conf.json` version changes on `main`.
+The workflow in [.github/workflows/release.yml](.github/workflows/release.yml) builds, signs, and publishes the NSIS installer, `aimem.exe`, and `latest.json` updater manifest whenever `app/tauri.conf.json` version changes on `main`.
 
 Required GitHub repository settings (**Settings → Secrets and variables → Actions**):
 - Variables: `AIMEM_GOOGLE_CLIENT_ID`, `TAURI_SIGNING_PUBLIC_KEY`

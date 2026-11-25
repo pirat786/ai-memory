@@ -38,6 +38,11 @@ function applyTranslations() {
   document.getElementById('cfgScanDirsLabel').textContent = t('scanDirsLabel');
   document.getElementById('cfgAutoSyncLabel').textContent = t('autoSyncLabel');
   document.getElementById('cfgAutostartLabel').textContent = t('autostart');
+  document.getElementById('inboxTitle').textContent = t('inboxTitle');
+  document.getElementById('inboxHelp').textContent = t('inboxHelp');
+  document.getElementById('inboxDirectoryLabel').textContent = t('inboxDirectory');
+  document.getElementById('inboxProjectsLabel').textContent = t('inboxProjects');
+  document.getElementById('importInboxBtn').textContent = t('importInbox');
   document.getElementById('reauthBtn').textContent = t('reauth');
   document.getElementById('closeModalBtn').textContent = t('close');
   document.getElementById('saveCfgBtn').textContent = t('save');
@@ -326,8 +331,39 @@ async function syncNow() {
 }
 
 async function openSettings() {
-  document.getElementById('cfgAutostart').checked = await invoke('get_autostart');
-  document.getElementById('settingsModal').classList.add('open');
+  try {
+    const [autostart, inbox] = await Promise.all([invoke('get_autostart'), invoke('get_inbox_settings')]);
+    document.getElementById('cfgAutostart').checked = autostart;
+    document.getElementById('inboxDirectory').value = inbox.directory || '';
+    document.getElementById('inboxProjects').value = inbox.projects.join('\n');
+    document.getElementById('settingsModal').classList.add('open');
+  } catch (err) {
+    toast(String(err));
+  }
+}
+
+async function importInbox() {
+  const button = document.getElementById('importInboxBtn');
+  button.disabled = true;
+  try {
+    const report = await invoke('import_inbox_now');
+    const labels = {
+      imported: 'inboxImported',
+      duplicates: 'inboxDuplicates',
+      skipped: 'inboxSkipped',
+      invalid: 'inboxInvalid',
+      pending: 'inboxPending',
+    };
+    toast(Object.entries(labels).map(([key, label]) => `${t(label)} ${report[key]}`).join(' · '));
+    if (report.imported) {
+      await loadProjects();
+      await loadMemories();
+    }
+  } catch (err) {
+    toast(String(err));
+  } finally {
+    button.disabled = false;
+  }
 }
 
 function closeSettings() {
@@ -341,24 +377,36 @@ async function disconnectGoogle() {
 }
 
 async function saveSettings() {
-  const scanDirs = document
-    .getElementById('cfgScanDirs')
-    .value.split(/[\r\n,;]+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
-  await invoke('save_settings', {
-    deviceName: document.getElementById('cfgDevice').value,
-    googleClientId: null,
-    googleClientSecret: null,
-    autoSync: document.getElementById('cfgAutoSync').checked,
-    scanDirs,
-  });
-  await invoke('set_autostart', {
-    enabled: document.getElementById('cfgAutostart').checked,
-  });
-  toast(t('settingsSaved'));
-  closeSettings();
-  await loadStatus();
+  const button = document.getElementById('saveCfgBtn');
+  button.disabled = true;
+  try {
+    const scanDirs = document.getElementById('cfgScanDirs').value.split(/[\r\n,;]+/)
+      .map((value) => value.trim()).filter(Boolean);
+    const projects = document.getElementById('inboxProjects').value.split(/\r?\n/)
+      .map((value) => value.trim()).filter(Boolean);
+
+    await invoke('save_inbox_settings', {
+      directory: document.getElementById('inboxDirectory').value,
+      projects,
+    });
+    await invoke('save_settings', {
+      deviceName: document.getElementById('cfgDevice').value,
+      googleClientId: null,
+      googleClientSecret: null,
+      autoSync: document.getElementById('cfgAutoSync').checked,
+      scanDirs,
+    });
+    await invoke('set_autostart', {
+      enabled: document.getElementById('cfgAutostart').checked,
+    });
+    toast(t('settingsSaved'));
+    closeSettings();
+    await loadStatus();
+  } catch (err) {
+    toast(String(err));
+  } finally {
+    button.disabled = false;
+  }
 }
 
 async function authGoogle() {

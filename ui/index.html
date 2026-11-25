@@ -94,6 +94,19 @@
         <input id="cfgAutostart" type="checkbox" style="width:auto;" />
         <span id="cfgAutostartLabel">Запускать вместе с Windows</span>
       </label>
+      <details class="inbox-settings">
+        <summary id="inboxTitle">Очередь записей агентов</summary>
+        <p id="inboxHelp">Приложение импортирует записи из выбранной папки, пока работает.</p>
+        <div class="field">
+          <label id="inboxDirectoryLabel" for="inboxDirectory">Папка очереди</label>
+          <input id="inboxDirectory" autocomplete="off" placeholder="C:\Projects\aimem-inbox" />
+        </div>
+        <div class="field">
+          <label id="inboxProjectsLabel" for="inboxProjects">Разрешённые ID проектов</label>
+          <textarea id="inboxProjects" rows="2" placeholder="local/my-project"></textarea>
+        </div>
+        <button id="importInboxBtn" type="button" onclick="importInbox()">Импортировать сохранённую очередь</button>
+      </details>
       <div class="composer-row" style="justify-content:space-between;margin-top:6px;">
         <button id="reauthBtn" onclick="authGoogle()">Переподключить Google</button>
         <div style="display:flex;gap:8px;">
