@@ -1,6 +1,6 @@
 use chrono::{Duration as ChronoDuration, Utc};
 use crate::inbox::InboxEntry;
-use rusqlite::{params, Connection, ErrorCode, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -73,6 +73,14 @@ pub struct MergeStats {
     pub memories_updated: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CompactReport {
+    pub size_before: u64,
+    pub size_after: u64,
+    pub tombstones_scrubbed: usize,
+    pub tombstones_purged: usize,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -89,6 +97,7 @@ pub struct AppConfig {
     pub last_sync_at: Option<String>,
     pub last_remote_md5: Option<String>,
     pub last_synced_local_ts: Option<String>,
+    pub last_compact_at: Option<String>,
     pub device_name: Option<String>,
     #[serde(default = "default_true")]
     pub auto_sync: bool,
@@ -109,6 +118,7 @@ impl Default for AppConfig {
             last_sync_at: None,
             last_remote_md5: None,
             last_synced_local_ts: None,
+            last_compact_at: None,
             device_name: None,
             auto_sync: true,
             auto_import_done: false,
@@ -116,6 +126,20 @@ impl Default for AppConfig {
             scan_dirs: Vec::new(),
         }
     }
+}
+
+pub fn should_auto_compact(cfg: &AppConfig) -> bool {
+    let Some(ref ts) = cfg.last_compact_at else {
+        return true;
+    };
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) else {
+        return true;
+    };
+    Utc::now() - parsed.with_timezone(&Utc) >= ChronoDuration::hours(24)
+}
+
+pub fn mark_compacted(cfg: &mut AppConfig) {
+    cfg.last_compact_at = Some(Utc::now().to_rfc3339());
 }
 
 pub fn data_dir() -> PathBuf {
@@ -173,6 +197,19 @@ impl Database {
         let dir = data_dir();
         std::fs::create_dir_all(&dir)?;
         Self::open(&dir.join("memory.db"))
+    }
+
+    pub fn open_read_only_default() -> Result<Self> {
+        Self::open_read_only(&data_dir().join("memory.db"))
+    }
+
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        Ok(Self { conn })
     }
 
     pub fn open(path: &Path) -> Result<Self> {
@@ -438,7 +475,24 @@ impl Database {
         ))
     }
 
-    pub fn add_entry(&self, entry: &InboxEntry) -> Result<Memory> {
+    pub fn find_active_duplicate(&self, project_id: &str, content: &str) -> Result<Option<Memory>> {
+        self.conn
+            .query_row(
+                "SELECT id, project_id, kind, content, tags, source_agent, created_at, updated_at, deleted_at
+                 FROM memories
+                 WHERE deleted_at IS NULL AND project_id = ?1 AND TRIM(content) = ?2
+                 LIMIT 1",
+                params![project_id, content.trim()],
+                row_to_memory,
+            )
+            .optional()
+            .map_err(DbError::from)
+    }
+
+    pub fn add_entry_dedup(&self, entry: &InboxEntry) -> Result<(Memory, bool)> {
+        if let Some(existing) = self.find_active_duplicate(&entry.project_id, &entry.content)? {
+            return Ok((existing, false));
+        }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         Self::insert_entry(&tx, entry)?;
         let memory = tx.query_row(
@@ -448,6 +502,11 @@ impl Database {
             row_to_memory,
         )?;
         tx.commit()?;
+        Ok((memory, true))
+    }
+
+    pub fn add_entry(&self, entry: &InboxEntry) -> Result<Memory> {
+        let (memory, _) = self.add_entry_dedup(entry)?;
         Ok(memory)
     }
 
@@ -604,6 +663,34 @@ impl Database {
         Ok(removed)
     }
 
+    /// Scrubs payload from soft-deleted tombstones (preserving sync IDs/timestamps),
+    /// rebuilds/optimizes FTS5, checkpoints WAL, and runs VACUUM.
+    pub fn compact(&mut self, db_path: &Path, purge_deleted_days: Option<i64>) -> Result<CompactReport> {
+        let size_before = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
+        let tombstones_purged = match purge_deleted_days {
+            Some(days) => self.gc_deleted(days)?,
+            None => 0,
+        };
+        let tombstones_scrubbed = self.conn.execute(
+            "UPDATE memories SET content = '', tags = ''
+             WHERE deleted_at IS NOT NULL AND (content != '' OR tags != '')",
+            [],
+        )?;
+        self.conn.execute_batch(
+            "INSERT INTO memories_fts(memories_fts) VALUES('rebuild');
+             INSERT INTO memories_fts(memories_fts) VALUES('optimize');
+             PRAGMA wal_checkpoint(TRUNCATE);
+             VACUUM;",
+        )?;
+        let size_after = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
+        Ok(CompactReport {
+            size_before,
+            size_after,
+            tombstones_scrubbed,
+            tombstones_purged,
+        })
+    }
+
     pub fn list_memories(&self, project_id: Option<&str>, limit: usize) -> Result<Vec<Memory>> {
         let limit_i = limit as i64;
         let mut results = Vec::new();
@@ -633,6 +720,17 @@ impl Database {
             }
         }
         Ok(results)
+    }
+
+    pub fn list_all_active_memories(&self) -> Result<Vec<Memory>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, project_id, kind, content, tags, source_agent, created_at, updated_at, deleted_at
+             FROM memories
+             WHERE deleted_at IS NULL
+             ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map([], row_to_memory)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(DbError::from)
     }
 
     pub fn search_memories(&self, query: &str, project_id: Option<&str>, limit: usize) -> Result<Vec<Memory>> {
@@ -925,6 +1023,63 @@ mod tests {
         let prefix = &m2.id[..8];
         assert_eq!(db1.soft_delete_memory_by_prefix(prefix).unwrap(), Some(m2.id));
         assert_eq!(db1.count_memories().unwrap(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_only_dedup_and_compact() {
+        let dir = std::env::temp_dir().join(format!("aimem_compact_test_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("memory.db");
+
+        let mut db = Database::open(&db_path).unwrap();
+        let proj = db.ensure_project("local/demo", "demo", None).unwrap();
+
+        let e1 = InboxEntry::new(
+            proj.id.clone(),
+            "decision".into(),
+            "Use WAL mode".into(),
+            "sqlite".into(),
+            "claude".into(),
+        );
+        let (m1, created1) = db.add_entry_dedup(&e1).unwrap();
+        assert!(created1);
+
+        let e2 = InboxEntry::new(
+            proj.id.clone(),
+            "decision".into(),
+            "  Use WAL mode  ".into(),
+            "sqlite".into(),
+            "codex".into(),
+        );
+        let (m2, created2) = db.add_entry_dedup(&e2).unwrap();
+        assert!(!created2);
+        assert_eq!(m1.id, m2.id);
+
+        let to_del = db
+            .add_memory(&proj.id, "note", "Temporary large payload", "tmp", "user")
+            .unwrap();
+        db.soft_delete_memory(&to_del.id).unwrap();
+
+        let ro = Database::open_read_only(&db_path).unwrap();
+        assert_eq!(ro.count_memories().unwrap(), 1);
+        assert_eq!(ro.search_memories("WAL", Some(&proj.id), 10).unwrap().len(), 1);
+        drop(ro);
+
+        let report = db.compact(&db_path, None).unwrap();
+        assert_eq!(report.tombstones_scrubbed, 1);
+        assert_eq!(report.tombstones_purged, 0);
+        assert!(report.size_after > 0);
+
+        // Tombstone remains with deleted_at preserved and payload scrubbed
+        let tombstone = db.get_memory(&to_del.id).unwrap().unwrap();
+        assert!(tombstone.deleted_at.is_some());
+        assert_eq!(tombstone.content, "");
+        assert_eq!(tombstone.tags, "");
+
+        // Active memory still searchable via FTS5 after rebuild
+        assert_eq!(db.search_memories("WAL", Some(&proj.id), 10).unwrap().len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

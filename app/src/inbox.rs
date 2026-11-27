@@ -1,4 +1,5 @@
-use aimem_core::inbox::{import_configured, ImportReport, InboxSettings};
+use aimem_core::db::Database;
+use aimem_core::inbox::{export_mirror, import_configured, ImportReport, InboxSettings, MIRROR_FILENAME};
 use std::path::PathBuf;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
@@ -22,12 +23,28 @@ pub async fn import_inbox_now() -> Result<ImportReport, String> {
 }
 
 pub fn start(handle: AppHandle) {
-    std::thread::spawn(move || loop {
-        if let Ok(report) = import_configured() {
-            if report.imported > 0 {
-                let _ = handle.emit("memory-synced", ());
+    std::thread::spawn(move || {
+        let mut last_mirror_ts: Option<String> = None;
+        loop {
+            if let Ok(report) = import_configured() {
+                if report.imported > 0 {
+                    let _ = handle.emit("memory-synced", ());
+                }
             }
+            if let Ok(settings) = InboxSettings::load() {
+                if let Some(dir) = settings.directory {
+                    if let Ok(db) = Database::open_read_only_default() {
+                        let current_ts = db.max_updated_at().ok().flatten();
+                        let missing = !dir.join(MIRROR_FILENAME).is_file();
+                        if missing || current_ts != last_mirror_ts {
+                            if export_mirror(&db, &dir).is_ok() {
+                                last_mirror_ts = current_ts;
+                            }
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_secs(5));
         }
-        std::thread::sleep(Duration::from_secs(5));
     });
 }

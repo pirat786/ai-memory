@@ -1,11 +1,16 @@
 mod add;
 
-use aimem_core::db::{data_dir, load_config, save_config, Database};
+use aimem_core::db::{data_dir, load_config, save_config, Database, Memory, Project};
 use aimem_core::importer::import_all;
+use aimem_core::inbox::{
+    export_mirror, import_configured, load_mirror, InboxSettings, MemoryMirror, MIRROR_FILENAME,
+};
 use aimem_core::project::detect_project;
-use aimem_core::rules::{install_global_rules, install_local_rules};
+use aimem_core::rules::{home_dir, install_global_rules, install_local_rules};
 use aimem_core::sync::{authenticate_google, sync_with_drive};
 use clap::{Parser, Subcommand};
+
+const MAX_CONTEXT_ENTRY_CHARS: usize = 700;
 
 #[derive(Parser)]
 #[command(name = "aimem", version, about = "Unified cross-agent AI memory without MCP")]
@@ -84,12 +89,170 @@ enum Commands {
         #[arg(long, default_value_t = 90)]
         days: i64,
     },
+    /// Scrub deleted payloads, optimize FTS5, and VACUUM database
+    Compact {
+        #[arg(long)]
+        purge_deleted_days: Option<i64>,
+    },
+    /// Inspect or import the shared agent inbox
+    Inbox {
+        #[command(subcommand)]
+        action: InboxAction,
+    },
+    /// Check binary path, DB access, inbox, rules, and agent permissions
+    Doctor,
     /// Show database path and sync status
     Status,
 }
 
+#[derive(Subcommand)]
+enum InboxAction {
+    /// Show configured inbox directory and pending files
+    Status,
+    /// Import pending inbox requests into SQLite
+    Import,
+}
+
 fn short_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let prefix: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{prefix}… _(truncated; use aimem search)_")
+    } else {
+        prefix
+    }
+}
+
+enum ReadStore {
+    Db(Database),
+    Mirror(MemoryMirror, std::path::PathBuf),
+}
+
+impl ReadStore {
+    fn get_project(&self, id: &str) -> Result<Option<Project>, String> {
+        match self {
+            Self::Db(db) => db.get_project(id).map_err(|e| e.to_string()),
+            Self::Mirror(m, _) => Ok(m.get_project(id)),
+        }
+    }
+
+    fn list_projects(&self) -> Result<Vec<Project>, String> {
+        match self {
+            Self::Db(db) => db.list_projects().map_err(|e| e.to_string()),
+            Self::Mirror(m, _) => Ok(m.list_projects()),
+        }
+    }
+
+    fn list_projects_with_counts(&self) -> Result<Vec<(Project, usize)>, String> {
+        match self {
+            Self::Db(db) => db.list_projects_with_counts().map_err(|e| e.to_string()),
+            Self::Mirror(m, _) => Ok(m.list_projects_with_counts()),
+        }
+    }
+
+    fn count_memories(&self) -> Result<usize, String> {
+        match self {
+            Self::Db(db) => db.count_memories().map_err(|e| e.to_string()),
+            Self::Mirror(m, _) => Ok(m.count_memories()),
+        }
+    }
+
+    fn list_memories(&self, project_id: Option<&str>, limit: usize) -> Result<Vec<Memory>, String> {
+        match self {
+            Self::Db(db) => db.list_memories(project_id, limit).map_err(|e| e.to_string()),
+            Self::Mirror(m, _) => Ok(m.list_memories(project_id, limit)),
+        }
+    }
+
+    fn search_memories(
+        &self,
+        query: &str,
+        project_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Memory>, String> {
+        match self {
+            Self::Db(db) => db
+                .search_memories(query, project_id, limit)
+                .map_err(|e| e.to_string()),
+            Self::Mirror(m, _) => Ok(m.search_memories(query, project_id, limit)),
+        }
+    }
+
+    fn source_label(&self) -> String {
+        match self {
+            Self::Db(_) => data_dir().display().to_string(),
+            Self::Mirror(_, dir) => format!("mirror ({})", dir.join(MIRROR_FILENAME).display()),
+        }
+    }
+}
+
+fn configured_inbox_dir() -> Option<std::path::PathBuf> {
+    std::env::var("AIMEM_INBOX_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| InboxSettings::load().ok().and_then(|s| s.directory))
+}
+
+fn open_read_store() -> Result<ReadStore, String> {
+    let db_path = data_dir().join("memory.db");
+    let db_err = if db_path.exists() {
+        match Database::open_read_only(&db_path) {
+            Ok(db) => return Ok(ReadStore::Db(db)),
+            Err(err) => Some(err.to_string()),
+        }
+    } else {
+        None
+    };
+
+    if let Some(dir) = configured_inbox_dir() {
+        if let Ok(mirror) = load_mirror(&dir) {
+            return Ok(ReadStore::Mirror(mirror, dir));
+        }
+    }
+
+    match db_err {
+        Some(err) => Err(err),
+        None => Database::open_default()
+            .map(ReadStore::Db)
+            .map_err(|e| e.to_string()),
+    }
+}
+
+fn refresh_mirror_if_configured(db: &Database) {
+    if let Some(dir) = configured_inbox_dir() {
+        let _ = export_mirror(db, &dir);
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.2} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn count_pending_inbox_files(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir)
+        .ok()
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| {
+                    let p = e.path();
+                    p.extension().and_then(|s| s.to_str()) == Some("json")
+                        && p.file_name().and_then(|s| s.to_str()) != Some(MIRROR_FILENAME)
+                })
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 fn main() {
@@ -108,18 +271,25 @@ fn run(cmd: Commands) -> Result<(), String> {
             max_chars,
             json,
         } => {
-            let db = Database::open_default().map_err(|e| e.to_string())?;
+            let store = open_read_store()?;
             let detected = detect_project(None);
             let pid = project.unwrap_or_else(|| detected.id.clone());
-            let proj = db
-                .ensure_project(&pid, &detected.name, detected.git_remote.as_deref())
-                .map_err(|e| e.to_string())?;
+            let proj = store
+                .get_project(&pid)?
+                .unwrap_or_else(|| Project {
+                    id: pid.clone(),
+                    name: detected.name.clone(),
+                    git_remote: detected.git_remote.clone(),
+                    summary: String::new(),
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                });
 
-            let global_items = db.list_memories(Some("global"), limit).map_err(|e| e.to_string())?;
+            let global_items = store.list_memories(Some("global"), limit)?;
             let project_items = if pid == "global" {
                 Vec::new()
             } else {
-                db.list_memories(Some(&pid), limit).map_err(|e| e.to_string())?
+                store.list_memories(Some(&pid), limit)?
             };
 
             if json {
@@ -140,30 +310,46 @@ fn run(cmd: Commands) -> Result<(), String> {
             }
             buf.push('\n');
 
-            let mut used_chars = buf.len();
+            let mut used_chars = buf.chars().count();
             let mut omitted = 0usize;
+            let global_budget = if max_chars > 0 {
+                (max_chars * 35) / 100
+            } else {
+                usize::MAX
+            };
+            let mut global_used = 0usize;
 
             if !global_items.is_empty() {
-                buf.push_str("## Global Preferences & Rules\n");
+                let header = "## Global Preferences & Rules\n";
+                buf.push_str(header);
+                used_chars += header.chars().count();
                 for m in &global_items {
+                    let snippet = truncate_chars(&m.content, MAX_CONTEXT_ENTRY_CHARS);
                     let line = format!(
                         "- [{}] {} _(id: {}, by {})_\n",
                         m.kind,
-                        m.content,
+                        snippet,
                         short_id(&m.id),
                         m.source_agent
                     );
-                    if max_chars > 0 && used_chars + line.len() > max_chars {
+                    let line_chars = line.chars().count();
+                    if (max_chars > 0 && used_chars + line_chars > max_chars)
+                        || (max_chars > 0 && global_used + line_chars > global_budget)
+                    {
                         omitted += 1;
                         continue;
                     }
-                    used_chars += line.len();
+                    used_chars += line_chars;
+                    global_used += line_chars;
                     buf.push_str(&line);
                 }
                 buf.push('\n');
+                used_chars += 1;
             }
 
-            buf.push_str("## Project Memory\n");
+            let proj_header = "## Project Memory\n";
+            buf.push_str(proj_header);
+            used_chars += proj_header.chars().count();
             if project_items.is_empty() {
                 buf.push_str("_(no project memories yet)_\n");
             } else {
@@ -173,19 +359,21 @@ fn run(cmd: Commands) -> Result<(), String> {
                     } else {
                         format!(" [tags: {}]", m.tags)
                     };
+                    let snippet = truncate_chars(&m.content, MAX_CONTEXT_ENTRY_CHARS);
                     let line = format!(
                         "- [{}] {}{} _(id: {}, by {})_\n",
                         m.kind,
-                        m.content,
+                        snippet,
                         tags,
                         short_id(&m.id),
                         m.source_agent
                     );
-                    if max_chars > 0 && used_chars + line.len() > max_chars {
+                    let line_chars = line.chars().count();
+                    if max_chars > 0 && used_chars + line_chars > max_chars {
                         omitted += 1;
                         continue;
                     }
-                    used_chars += line.len();
+                    used_chars += line_chars;
                     buf.push_str(&line);
                 }
             }
@@ -203,15 +391,13 @@ fn run(cmd: Commands) -> Result<(), String> {
             limit,
             json,
         } => {
-            let db = Database::open_default().map_err(|e| e.to_string())?;
+            let store = open_read_store()?;
             let pid = if project_only {
                 Some(detect_project(None).id)
             } else {
                 None
             };
-            let items = db
-                .search_memories(&query, pid.as_deref(), limit)
-                .map_err(|e| e.to_string())?;
+            let items = store.search_memories(&query, pid.as_deref(), limit)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&items).unwrap());
                 return Ok(());
@@ -229,15 +415,15 @@ fn run(cmd: Commands) -> Result<(), String> {
             project,
             limit,
         } => {
-            let db = Database::open_default().map_err(|e| e.to_string())?;
+            let store = open_read_store()?;
             if projects {
-                for (p, count) in db.list_projects_with_counts().map_err(|e| e.to_string())? {
+                for (p, count) in store.list_projects_with_counts()? {
                     println!("{} — {} ({count} memories)", p.id, p.name);
                 }
                 return Ok(());
             }
             let pid = project.unwrap_or_else(|| detect_project(None).id);
-            let items = db.list_memories(Some(&pid), limit).map_err(|e| e.to_string())?;
+            let items = store.list_memories(Some(&pid), limit)?;
             for m in items {
                 println!("[{}] {} — {}", m.kind, m.id, m.content);
             }
@@ -325,16 +511,108 @@ fn run(cmd: Commands) -> Result<(), String> {
             let removed = db.gc_deleted(days).map_err(|e| e.to_string())?;
             println!("Purged {removed} deleted memories older than {days} days.");
         }
+        Commands::Compact { purge_deleted_days } => {
+            let mut db = Database::open_default().map_err(|e| e.to_string())?;
+            let db_path = data_dir().join("memory.db");
+            let report = db
+                .compact(&db_path, purge_deleted_days)
+                .map_err(|e| e.to_string())?;
+            refresh_mirror_if_configured(&db);
+            println!(
+                "Compacted {}: {} -> {} (scrubbed {} tombstones, purged {}).",
+                db_path.display(),
+                format_bytes(report.size_before),
+                format_bytes(report.size_after),
+                report.tombstones_scrubbed,
+                report.tombstones_purged
+            );
+        }
+        Commands::Inbox { action } => match action {
+            InboxAction::Status => {
+                let settings = InboxSettings::load().unwrap_or_default();
+                let env_dir = std::env::var("AIMEM_INBOX_DIR").ok().filter(|s| !s.trim().is_empty());
+                println!(
+                    "Inbox dir (config): {}",
+                    settings
+                        .directory
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "not configured".into())
+                );
+                println!(
+                    "AIMEM_INBOX_DIR:    {}",
+                    env_dir.as_deref().unwrap_or("not set")
+                );
+                println!("Allow all projects: {}", settings.allow_all_projects);
+                println!("Allowed projects:   {}", settings.projects.len());
+                let active_dir = env_dir
+                    .map(std::path::PathBuf::from)
+                    .or(settings.directory);
+                let pending = active_dir
+                    .as_deref()
+                    .map(count_pending_inbox_files)
+                    .unwrap_or(0);
+                println!("Pending requests:   {pending}");
+                let mirror_info = active_dir
+                    .as_ref()
+                    .map(|d| d.join(MIRROR_FILENAME))
+                    .map(|p| match std::fs::metadata(&p) {
+                        Ok(m) => format!("{} ({})", p.display(), format_bytes(m.len())),
+                        Err(_) => "missing".to_string(),
+                    })
+                    .unwrap_or_else(|| "not configured".to_string());
+                println!("Read mirror:        {mirror_info}");
+            }
+            InboxAction::Import => {
+                let report = import_configured().map_err(|e| e.to_string())?;
+                if report.imported > 0 {
+                    if let Ok(db) = Database::open_read_only_default() {
+                        refresh_mirror_if_configured(&db);
+                    }
+                }
+                println!(
+                    "Inbox import: {} imported, {} duplicates, {} skipped, {} invalid, {} pending.",
+                    report.imported,
+                    report.duplicates,
+                    report.skipped,
+                    report.invalid,
+                    report.pending
+                );
+            }
+        },
+        Commands::Doctor => {
+            run_doctor();
+        }
         Commands::Status => {
-            let db = Database::open_default().map_err(|e| e.to_string())?;
+            let store = open_read_store()?;
             let cfg = load_config();
             let detected = detect_project(None);
-            let projects = db.list_projects().map_err(|e| e.to_string())?;
-            let active_memories = db.count_memories().map_err(|e| e.to_string())?;
-            println!("Data dir:         {}", data_dir().display());
+            let projects = store.list_projects()?;
+            let active_memories = store.count_memories()?;
+            let db_size = std::fs::metadata(data_dir().join("memory.db"))
+                .map(|m| format_bytes(m.len()))
+                .unwrap_or_else(|_| "via mirror".into());
+            let inbox = InboxSettings::load().ok();
+            let inbox_dir = configured_inbox_dir();
+            let inbox_summary = match inbox_dir {
+                Some(ref dir) => {
+                    let pending = count_pending_inbox_files(dir);
+                    let allow_all = inbox.as_ref().is_some_and(|s| s.allow_all_projects);
+                    let proj_cnt = inbox.as_ref().map(|s| s.projects.len()).unwrap_or(0);
+                    let mirror_ok = dir.join(MIRROR_FILENAME).is_file();
+                    format!(
+                        "{} (allow_all={allow_all}, projects={proj_cnt}, pending={pending}, mirror={mirror_ok})",
+                        dir.display()
+                    )
+                }
+                None => "not configured".to_string(),
+            };
+            println!("Data source:      {}", store.source_label());
+            println!("Database size:    {db_size}");
             println!("Current project:  {} ({})", detected.name, detected.id);
             println!("Projects:         {}", projects.len());
             println!("Active memories:  {}", active_memories);
+            println!("Inbox:            {inbox_summary}");
             println!("Google connected: {}", cfg.google_refresh_token.is_some());
             println!(
                 "Last sync:        {}",
@@ -343,4 +621,85 @@ fn run(cmd: Commands) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn run_doctor() {
+    if let Ok(exe) = std::env::current_exe() {
+        let exe_str = exe.display().to_string();
+        let in_target = exe_str.contains(r"\target\") || exe_str.contains("/target/");
+        let tag = if in_target { "WARN" } else { "OK  " };
+        println!("[{tag}] binary: {exe_str}{}", if in_target { " (in target/; copy to stable bin)" } else { "" });
+    }
+
+    let db_path = data_dir().join("memory.db");
+    match Database::open_read_only(&db_path) {
+        Ok(db) => {
+            let size = std::fs::metadata(&db_path).map(|m| format_bytes(m.len())).unwrap_or_default();
+            let count = db.count_memories().unwrap_or(0);
+            println!("[OK  ] db read: {} ({size}, {count} active)", db_path.display());
+        }
+        Err(e) => println!("[FAIL] db read: {} ({e})", db_path.display()),
+    }
+    match Database::open_default() {
+        Ok(_) => println!("[OK  ] db write: accessible"),
+        Err(e) => println!("[WARN] db write: {e}"),
+    }
+
+    let env_inbox = std::env::var("AIMEM_INBOX_DIR").ok().filter(|s| !s.trim().is_empty());
+    let settings = InboxSettings::load().ok();
+    let inbox_dir = env_inbox
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .or_else(|| settings.as_ref().and_then(|s| s.directory.clone()));
+    match inbox_dir {
+        Some(dir) => {
+            let exists = dir.is_dir();
+            let pending = count_pending_inbox_files(&dir);
+            let allow_all = settings.as_ref().is_some_and(|s| s.allow_all_projects);
+            let proj_cnt = settings.as_ref().map(|s| s.projects.len()).unwrap_or(0);
+            let mirror_ok = dir.join(MIRROR_FILENAME).is_file();
+            let tag = if exists && env_inbox.is_some() && mirror_ok { "OK  " } else { "WARN" };
+            println!(
+                "[{tag}] inbox: {} (exists={exists}, env_set={}, allow_all={allow_all}, projects={proj_cnt}, mirror={mirror_ok}, pending={pending})",
+                dir.display(),
+                env_inbox.is_some()
+            );
+        }
+        None => println!("[WARN] inbox: not configured (no AIMEM_INBOX_DIR or inbox.json)"),
+    }
+
+    let home = home_dir();
+    let rule_files = [
+        ("Claude", home.join(".claude").join("CLAUDE.md")),
+        ("Antigravity AGENTS", home.join(".gemini").join("antigravity").join("AGENTS.md")),
+        ("Gemini", home.join(".gemini").join("GEMINI.md")),
+        ("Codex", home.join(".codex").join("AGENTS.md")),
+        ("Cursor", home.join(".cursor").join("rules").join("aimem.mdc")),
+    ];
+    for (name, path) in rule_files {
+        let has_block = std::fs::read_to_string(&path)
+            .map(|c| c.contains("<!-- AI-MEMORY-START -->"))
+            .unwrap_or(false);
+        let tag = if has_block { "OK  " } else { "WARN" };
+        println!("[{tag}] rule {name}: {}", path.display());
+    }
+
+    let claude_settings = home.join(".claude").join("settings.json");
+    let (has_perm, has_hook) = std::fs::read_to_string(&claude_settings)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .map(|v| {
+            let perm = v["permissions"]["allow"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|x| x.as_str() == Some("Bash(aimem:*)")));
+            let hook = v["hooks"]["SessionStart"]
+                .as_array()
+                .is_some_and(|a| {
+                    serde_json::to_string(a).is_ok_and(|s| s.contains("aimem context"))
+                });
+            (perm, hook)
+        })
+        .unwrap_or((false, false));
+    let tag = if has_perm && has_hook { "OK  " } else { "WARN" };
+    println!("[{tag}] claude settings: allow_aimem={has_perm}, session_start_hook={has_hook}");
 }

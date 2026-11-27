@@ -21,6 +21,7 @@ impl Fixture {
         InboxSettings {
             directory: Some(self.directory()),
             projects: vec!["local/trusted".into()],
+            allow_all_projects: false,
         }
     }
 }
@@ -131,4 +132,42 @@ fn ignores_linked_requests() {
     assert_eq!(report.imported, 0);
     assert_eq!(report.invalid, 1);
     assert!(outside.exists());
+}
+
+#[test]
+fn allow_all_projects_imports_new_projects_and_still_blocks_global() {
+    let fixture = Fixture::new();
+    let mut db = fixture.database();
+    let directory = fixture.directory();
+    request("local/brand-new", "codex").enqueue(&directory).unwrap();
+    assert!(request("global", "codex").enqueue(&directory).is_err());
+
+    let settings = InboxSettings {
+        directory: Some(directory.clone()),
+        projects: vec![],
+        allow_all_projects: true,
+    };
+    let report = import(&settings, |entry| db.import_inbox_entry(entry)).unwrap();
+    assert_eq!(report.imported, 1);
+    assert!(db.get_project("local/brand-new").unwrap().is_some());
+}
+
+#[test]
+fn mirror_round_trip_excludes_deleted_and_supports_search() {
+    let fixture = Fixture::new();
+    let db = fixture.database();
+    let proj = db.ensure_project("local/demo", "demo", None).unwrap();
+    db.add_memory(&proj.id, "decision", "Use SQLite WAL mode", "sqlite", "claude").unwrap();
+    let del = db.add_memory(&proj.id, "note", "Deleted secret note", "tmp", "user").unwrap();
+    db.soft_delete_memory(&del.id).unwrap();
+    db.add_memory("global", "pref", "Answer in Russian", "lang", "user").unwrap();
+
+    export_mirror(&db, &fixture.directory()).unwrap();
+    let mirror = load_mirror(&fixture.directory()).unwrap();
+    assert_eq!(mirror.count_memories(), 2);
+    assert_eq!(mirror.list_memories(Some(&proj.id), 10).len(), 1);
+    let hits = mirror.search_memories("sqlite wal", Some(&proj.id), 10);
+    assert_eq!(hits.len(), 1);
+    let global_hits = mirror.search_memories("russian", Some(&proj.id), 10);
+    assert_eq!(global_hits.len(), 1);
 }

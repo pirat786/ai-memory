@@ -1,18 +1,22 @@
-use crate::db::{data_dir, Database, DbError, Result};
+use crate::db::{data_dir, Database, DbError, Memory, Project, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+pub const MIRROR_FILENAME: &str = "memory-mirror.json";
 const MAX_REQUEST_BYTES: u64 = 128 * 1024;
 const MAX_CONTENT_BYTES: usize = 32 * 1024;
+const MAX_MIRROR_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct InboxSettings {
     pub directory: Option<PathBuf>,
     pub projects: Vec<String>,
+    pub allow_all_projects: bool,
 }
 
 impl InboxSettings {
@@ -29,6 +33,14 @@ impl InboxSettings {
     }
 
     pub fn save(directory: Option<PathBuf>, projects: Vec<String>) -> Result<()> {
+        Self::save_with_options(directory, projects, false)
+    }
+
+    pub fn save_with_options(
+        directory: Option<PathBuf>,
+        projects: Vec<String>,
+        allow_all_projects: bool,
+    ) -> Result<()> {
         let directory = directory.map(|path| validate_directory(&path)).transpose()?;
         let mut projects = projects
             .into_iter()
@@ -41,13 +53,20 @@ impl InboxSettings {
         if projects.iter().any(|id| !valid_project(id)) {
             return Err(invalid("The inbox accepts project IDs only, excluding global."));
         }
-        if directory.is_some() && projects.is_empty() {
+        if directory.is_some() && !allow_all_projects && projects.is_empty() {
             return Err(invalid("Select at least one project ID for the inbox."));
         }
 
         let path = Self::path();
         fs::create_dir_all(data_dir())?;
-        write_atomic(&path, &serde_json::to_vec_pretty(&Self { directory, projects })?)
+        write_atomic(
+            &path,
+            &serde_json::to_vec_pretty(&Self {
+                directory,
+                projects,
+                allow_all_projects,
+            })?,
+        )
     }
 }
 
@@ -149,7 +168,7 @@ fn import(
                 continue;
             }
         };
-        if !settings.projects.contains(&entry.project_id) {
+        if !settings.allow_all_projects && !settings.projects.contains(&entry.project_id) {
             report.skipped += 1;
             continue;
         }
@@ -253,6 +272,108 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&temp);
     }
     Ok(result?)
+}
+
+/// Read-only JSON snapshot of active memories placed in the shared inbox folder
+/// so sandboxed agents that cannot reach %APPDATA%\ai-memory\memory.db can still read context/search.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryMirror {
+    pub exported_at: String,
+    pub projects: Vec<Project>,
+    pub memories: Vec<Memory>,
+}
+
+impl MemoryMirror {
+    pub fn get_project(&self, id: &str) -> Option<Project> {
+        self.projects.iter().find(|p| p.id == id).cloned()
+    }
+
+    pub fn list_projects(&self) -> Vec<Project> {
+        self.projects.clone()
+    }
+
+    pub fn list_projects_with_counts(&self) -> Vec<(Project, usize)> {
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for m in &self.memories {
+            *counts.entry(m.project_id.as_str()).or_insert(0) += 1;
+        }
+        self.projects
+            .iter()
+            .cloned()
+            .map(|p| {
+                let c = counts.get(p.id.as_str()).copied().unwrap_or(0);
+                (p, c)
+            })
+            .collect()
+    }
+
+    pub fn count_memories(&self) -> usize {
+        self.memories.len()
+    }
+
+    pub fn list_memories(&self, project_id: Option<&str>, limit: usize) -> Vec<Memory> {
+        self.memories
+            .iter()
+            .filter(|m| project_id.is_none_or(|pid| m.project_id == pid))
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    pub fn search_memories(&self, query: &str, project_id: Option<&str>, limit: usize) -> Vec<Memory> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return self.list_memories(project_id, limit);
+        }
+        let tokens: Vec<String> = trimmed
+            .split_whitespace()
+            .map(|t| t.to_lowercase())
+            .collect();
+        self.memories
+            .iter()
+            .filter(|m| project_id.is_none_or(|pid| m.project_id == pid || m.project_id == "global"))
+            .filter(|m| {
+                let hay_content = m.content.to_lowercase();
+                let hay_tags = m.tags.to_lowercase();
+                let hay_kind = m.kind.to_lowercase();
+                tokens.iter().all(|tok| {
+                    hay_content.contains(tok) || hay_tags.contains(tok) || hay_kind.contains(tok)
+                })
+            })
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+}
+
+pub fn export_mirror(db: &Database, directory: &Path) -> Result<()> {
+    let directory = validate_directory(directory)?;
+    let mirror = MemoryMirror {
+        exported_at: db.max_updated_at()?.unwrap_or_default(),
+        projects: db.list_projects()?,
+        memories: db.list_all_active_memories()?,
+    };
+    let bytes = serde_json::to_vec(&mirror)?;
+    write_atomic(&directory.join(MIRROR_FILENAME), &bytes)
+}
+
+pub fn load_mirror(directory: &Path) -> Result<MemoryMirror> {
+    let directory = validate_directory(directory)?;
+    let path = directory.join(MIRROR_FILENAME);
+    let metadata = fs::symlink_metadata(&path)?;
+    if !plain_file(&metadata) {
+        return Err(invalid("Mirror file must be a regular file."));
+    }
+    let file = File::open(&path)?;
+    if !plain_file(&file.metadata()?) {
+        return Err(invalid("Mirror file must be a regular file."));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_MIRROR_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_MIRROR_BYTES {
+        return Err(invalid("Mirror file exceeds size limit."));
+    }
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 #[cfg(test)]

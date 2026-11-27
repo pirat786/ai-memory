@@ -2,7 +2,9 @@
 
 mod inbox;
 
-use aimem_core::db::{data_dir, load_config, save_config, Database, Memory};
+use aimem_core::db::{
+    data_dir, load_config, mark_compacted, save_config, should_auto_compact, Database, Memory,
+};
 use aimem_core::importer::{import_all, ImportReport};
 use aimem_core::rules::{ensure_aimem_in_path, install_global_rules};
 use aimem_core::sync::{
@@ -399,6 +401,14 @@ fn main() {
                         if let Ok(mut db) = Database::open_default() {
                             if sync_with_drive(&mut db, &mut cfg).is_ok() {
                                 let _ = handle.emit("memory-synced", ());
+                            }
+                        }
+                    }
+                    if should_auto_compact(&cfg) {
+                        if let Ok(mut db) = Database::open_default() {
+                            if db.compact(&data_dir().join("memory.db"), Some(90)).is_ok() {
+                                mark_compacted(&mut cfg);
+                                let _ = save_config(&cfg);
                             }
                         }
                     }
